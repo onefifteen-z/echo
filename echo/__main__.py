@@ -60,8 +60,8 @@ def main() -> None:
         "--live-system-authorized",
         action="store_true",
         help=(
-            "Use a macOS system-audio capture command that requests Screen Recording permission "
-            "(e.g. SystemAudioDump), then mix with microphone. No BlackHole required."
+            "Use the bundled macOS system-audio helper (System Audio Recording Only on macOS 14.2+, "
+            "ScreenCaptureKit fallback otherwise) and mix with microphone. No BlackHole required."
         ),
     )
     p.add_argument(

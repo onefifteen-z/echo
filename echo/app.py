@@ -215,12 +215,12 @@ def _meter_vertical_chart(
     out: list[str] = []
     for r in range(rows, 0, -1):
         if r <= rows // 3:
-            blk = "██"
+            blk = "█"
         elif r <= (rows * 2) // 3:
-            blk = "▓▓"
+            blk = "▓"
         else:
-            blk = "▒▒"
-        line = "".join(blk if h >= r else "  " for h in heights)
+            blk = "▒"
+        line = " ".join(blk if h >= r else " " for h in heights).rstrip()
         out.append(line)
     return out
 
@@ -667,7 +667,7 @@ class EchoApp(App[None]):
         off = " · no LLM" if self._llm_offline else ""
         self.sub_title = f"🎙 {mode} · {state}{off}  [{self._elapsed_hms()}]  p/s/c/q"
 
-    def _input_meter_text(self) -> str:
+    def _input_meter_text(self, *, chart_cols: int | None = None) -> str:
         if not self.live_audio:
             return "Input level\navailable in --live mode"
 
@@ -695,9 +695,10 @@ class EchoApp(App[None]):
             max(0.0, min(1.0, (p * 0.75) + (r * 0.25)))
             for r, p in zip(self._live_rms_hist, self._live_peak_hist, strict=False)
         ]
+        cols = max(8, chart_cols if chart_cols is not None else self.live_meter_history_width)
         chart = _meter_vertical_chart(
             blend,
-            width=self.live_meter_history_width,
+            width=cols,
             rows=_METER_CHART_ROWS,
         )
         chart_block = "\n".join(chart)
@@ -719,7 +720,11 @@ class EchoApp(App[None]):
             if len(self._live_peak_hist) > self.live_meter_history_width:
                 self._live_peak_hist = self._live_peak_hist[-self.live_meter_history_width :]
         meter = self.query_one("#input_meter", Static)
-        meter.update(self._input_meter_text())
+        chart_cols = self.live_meter_history_width
+        if meter.size.width > 0:
+            # 2 chars per column (bar + space), reserve a bit for panel borders.
+            chart_cols = max(8, min(self.live_meter_history_width, (meter.size.width - 4) // 2))
+        meter.update(self._input_meter_text(chart_cols=chart_cols))
 
     def _live_preview_view(self) -> str:
         if not self.live_audio:
@@ -1027,7 +1032,8 @@ class EchoApp(App[None]):
             self._log_transcript_meta(
                 log,
                 "[dim]Live: microphone + system output via authorized macOS capture command "
-                "(Screen Recording + Microphone permissions may be requested). "
+                "(System Audio Recording Only on macOS 14.2+, otherwise Screen Recording; "
+                "Microphone permission may also be requested). "
                 f"Transcript flushes on stop words/punctuation or every ~{self.live_emit_interval:.0f}s.[/]",
             )
         elif self.live_system_device is None:

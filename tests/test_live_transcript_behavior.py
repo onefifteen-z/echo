@@ -44,7 +44,7 @@ def test_meter_helpers_map_amplitude_to_bar() -> None:
     assert _meter_timeline([0.0, 0.5, 1.0], width=6).endswith(" =@")
     chart = _meter_vertical_chart([0.0, 0.5, 1.0], width=6, rows=4)
     assert len(chart) == 4
-    assert any("██" in row or "▓▓" in row or "▒▒" in row for row in chart)
+    assert any("█" in row or "▓" in row or "▒" in row for row in chart)
 
 
 def test_live_voice_gate_rejects_silence_chunk() -> None:

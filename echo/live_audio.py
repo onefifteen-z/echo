@@ -34,7 +34,12 @@ def _system_audio_helper_binary_path() -> Path:
 
 
 def ensure_macos_system_audio_helper() -> str:
-    """Build bundled ScreenCaptureKit helper and return executable path."""
+    """Build bundled system-audio helper and return executable path.
+
+    The helper prefers the macOS 14.2+ Core Audio process-tap path
+    (only triggers the "System Audio Recording Only" privacy prompt) and
+    falls back to ScreenCaptureKit when that is unavailable.
+    """
     if sys.platform != "darwin":
         raise RuntimeError("System-authorized live capture is available on macOS only.")
 
@@ -57,6 +62,10 @@ def ensure_macos_system_audio_helper() -> str:
         "ScreenCaptureKit",
         "-framework",
         "AVFoundation",
+        "-framework",
+        "CoreAudio",
+        "-framework",
+        "AudioToolbox",
         "-framework",
         "CoreMedia",
         "-framework",

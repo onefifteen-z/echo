@@ -151,13 +151,18 @@ Echo does **not** ship or install audio drivers.
 Echo supports a real-time path that mixes:
 
 - microphone from `sounddevice`, and
-- system output from a command that uses **ScreenCaptureKit** authorization (Screen Recording).
+- system output captured by a bundled macOS helper.
 
-By default, Echo auto-builds and runs a bundled helper (`echo/macos/SystemAudioCapture.swift`) on first use. It requests Screen Recording permission and writes `s16le` stereo PCM @ 24kHz to stdout.
+By default, Echo auto-builds and runs `echo/macos/SystemAudioCapture.swift` on first use. The helper writes `s16le` stereo PCM @ 24kHz to stdout and chooses the **least invasive** permission path available:
+
+1. **macOS 14.2+ (preferred): Core Audio process tap.** Triggers only the **System Audio Recording Only** prompt — no Screen Recording required. Echo creates a private global tap + aggregate device under the hood.
+2. **Fallback: ScreenCaptureKit.** Used when the tap path is unavailable or denied. Requires the broader **Screen Recording** permission.
+
+Steps:
 
 1. Run Echo live mode:
    `echo-tui --live --live-system-authorized`
-2. macOS prompts for **Screen Recording** permission (and microphone for your terminal app if not granted yet). Approve both.
+2. Approve the macOS prompt (microphone for your terminal app if not granted yet). On macOS 14.2+ this is **System Audio Recording Only**; on older macOS it is **Screen Recording**.
 3. Optional: provide your own command instead of the bundled helper:
    `echo-tui --live --live-system-authorized --live-system-authorized-cmd "/path/to/cmd"`
 4. Optional persistent override:
@@ -167,6 +172,7 @@ Notes:
 
 - `--live-system-authorized` cannot be combined with `--live-system-device`.
 - If helper build or system capture startup fails, Echo shows a startup error in Transcript.
+- To force the ScreenCaptureKit fallback (e.g. for debugging), set `ECHO_DISABLE_AUDIO_TAP=1` before launching.
 
 Fallback (always works, no real-time requirements): Zoom/QuickTime recording → `echo-tui --audio file`.
 
