@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Echo">
+  <title>Echo</title>
+  <desc>Interleaved sound wave arcs on a dark rounded square background.</desc>
+  <rect width="512" height="512" rx="112" ry="112" fill="#0d0d0d"/>
+  <g fill="none" stroke="#ffffff" stroke-width="14" stroke-linecap="round">
+    <!-- Right channel: 3 arcs centered at y=236 -->
+    <path d="M 256 208 Q 284 236 256 264"/>
+    <path d="M 256 160 Q 340 236 256 312"/>
+    <path d="M 256 112 Q 396 236 256 360"/>
+    <!-- Left channel: 3 arcs centered at y=276 (offset +40) -->
+    <path d="M 256 248 Q 228 276 256 304"/>
+    <path d="M 256 200 Q 172 276 256 352"/>
+    <path d="M 256 152 Q 116 276 256 400"/>
+  </g>
+</svg>

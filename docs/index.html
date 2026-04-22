@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <script>
+      (function () {
+        try {
+          var k = "echo-docs-theme";
+          var s = localStorage.getItem(k);
+          var dark = s === "dark" || (s !== "light" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.setAttribute("data-site-theme", dark ? "dark" : "light");
+        } catch (e) {}
+      })();
+    </script>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Echo — a live meeting assistant: follow a rolling transcript, see periodic web context and optional AI insights, and ask chat questions grounded in what was said."
+    />
+    <title>Echo — live meeting assistant</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <link rel="icon" type="image/svg+xml" href="./assets/echo-icon.svg" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to main content</a>
+    <div class="scroll-progress" aria-hidden="true"></div>
+
+    <header class="top-nav">
+      <div class="top-nav__inner wrap">
+        <a class="top-nav__brand" href="#top" aria-label="Echo home">
+          <img src="./assets/echo-icon.svg" width="32" height="32" alt="" />
+          <span>Echo</span>
+        </a>
+        <nav class="top-nav__links" aria-label="Primary">
+          <a href="#experience">Experience</a>
+          <a href="#features">Features</a>
+          <a href="#privacy">Privacy</a>
+          <a href="#install">Install</a>
+          <button type="button" class="theme-toggle" id="theme-toggle" role="switch" aria-checked="false" title="Theme">
+            <svg class="theme-toggle__icon theme-toggle__icon--sun" viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2" />
+              <path
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"
+              />
+            </svg>
+            <svg class="theme-toggle__icon theme-toggle__icon--moon" viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                d="M21 14.5A8.5 8.5 0 0 1 9.5 3 6.5 6.5 0 1 0 21 14.5Z"
+              />
+            </svg>
+          </button>
+          <a
+            class="top-nav__cta"
+            href="https://github.com/McK-Playground/prj-echo"
+            target="_blank"
+            rel="noopener noreferrer"
+            >GitHub</a
+          >
+        </nav>
+      </div>
+    </header>
+
+    <section class="hero" id="top">
+      <div class="hero__glow" aria-hidden="true"></div>
+      <div class="hero__noise" aria-hidden="true"></div>
+      <div class="wrap hero__grid">
+        <div class="hero__copy reveal">
+          <p class="hero__eyebrow">Live meetings · Transcript · Insights</p>
+          <h1>Your <span class="hero__accent">live</span> meeting assistant</h1>
+          <p class="hero__lead">
+            Echo follows the meetings you already join. You get a <strong>live transcript</strong> of both sides of
+            the call, periodic <strong>web context</strong>, optional <strong>AI highlights</strong>, and
+            <strong>chat</strong> over the whole thread—so “what did we decide?” is a question, not a replay hunt.
+          </p>
+          <div class="hero__actions">
+            <a
+              class="btn btn-primary btn-lg"
+              href="https://github.com/McK-Playground/prj-echo"
+              target="_blank"
+              rel="noopener noreferrer"
+              >View on GitHub</a
+            >
+            <a class="btn btn-ghost btn-lg" href="#install">Install from source</a>
+          </div>
+          <ul class="hero__bullets" aria-label="Key points">
+            <li><strong>Stay in sync:</strong> the transcript updates as the meeting moves, not after export day.</li>
+            <li><strong>Context on demand:</strong> periodic web lookups bring fresh references next to the conversation.</li>
+            <li><strong>Ask, don’t scrub:</strong> chat answers over the full thread so you catch decisions and owners faster.</li>
+          </ul>
+        </div>
+        <div class="hero__visual reveal reveal--delay" aria-hidden="true">
+          <div class="echo-term echo-term--float">
+            <div class="echo-term__titlebar">
+              <div class="echo-term__dots" aria-hidden="true"><span></span><span></span><span></span></div>
+              <div class="echo-term__title">Echo — live meeting assistant</div>
+            </div>
+            <div class="echo-term__body">
+              <div class="echo-pane">
+                <div class="echo-pane__label">Transcript</div>
+                <div class="echo-line">[00:12] Opening remarks and agenda check-in…</div>
+                <div class="echo-line echo-line--hi">[00:28] Decision: ship the revised onboarding flow this week.</div>
+                <div class="echo-line">[00:41] Parking lot — follow up offline on vendor pricing.</div>
+              </div>
+              <div class="echo-pane echo-pane--stack">
+                <div class="echo-subpane">
+                  <div class="echo-pane__label">Insights</div>
+                  <div class="echo-chiprow">
+                    <span class="echo-chip">launch</span>
+                    <span class="echo-chip">budget</span>
+                    <span class="echo-chip">customer</span>
+                  </div>
+                  <div class="echo-line" style="margin-top: 6px; font-size: 11px">Web: 3 hits · summary ready</div>
+                </div>
+                <div class="echo-subpane">
+                  <div class="echo-pane__label">Chat</div>
+                  <div class="echo-line echo-line--tag">&gt; What were the action items?</div>
+                  <div class="echo-chat">Three owners: onboarding (you), pricing follow-up (Finance), customer comms (PM).</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <main id="main">
+      <section class="section section--tight wrap" id="experience">
+        <p class="section__eyebrow reveal">Live assistant layout</p>
+        <h2 class="section__title reveal">Three panels tuned for calls that are happening now</h2>
+        <p class="section__intro reveal">
+          During a <strong>live meeting</strong>, Echo mirrors how you actually work: follow the transcript as it
+          grows, skim keywords and web hits beside the conversation, then ask the chat strip for a precise answer grounded
+          in what people just said—without juggling another heavyweight meeting tab.
+        </p>
+
+        <article class="showcase reveal">
+          <div class="showcase__text">
+            <h3>Transcript stays primary—even when the meeting is live</h3>
+            <p>
+              In <strong>live</strong> mode, new lines appear as the meeting unfolds so you are never rereading a
+              static wall of text. Demo, replay, and saved-audio paths are there when you want to rehearse or debrief, but
+              the layout is built around a transcript that keeps moving like the call itself.
+            </p>
+          </div>
+          <div class="showcase__mock">
+            <div class="echo-term echo-term--tilt">
+              <div class="echo-term__titlebar">
+                <div class="echo-term__dots" aria-hidden="true"><span></span><span></span><span></span></div>
+                <div class="echo-term__title">Echo — replay</div>
+              </div>
+              <div class="echo-term__body">
+                <div class="echo-pane">
+                  <div class="echo-pane__label">Transcript</div>
+                  <div class="echo-line">[01:05] Risk register reviewed; two items closed.</div>
+                  <div class="echo-line echo-line--hi">[01:18] New risk: onboarding drop-off after day seven.</div>
+                  <div class="echo-line">[01:30] Mitigation: pair success metrics with lifecycle emails.</div>
+                </div>
+                <div class="echo-pane echo-pane--stack">
+                  <div class="echo-subpane">
+                    <div class="echo-pane__label">Insights</div>
+                    <div class="echo-chiprow">
+                      <span class="echo-chip">retention</span>
+                      <span class="echo-chip">email</span>
+                    </div>
+                  </div>
+                  <div class="echo-subpane">
+                    <div class="echo-pane__label">Chat</div>
+                    <div class="echo-chat muted" style="color: #94a3b8">Ask a follow-up…</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <article class="showcase showcase--reverse reveal">
+          <div class="showcase__text">
+            <h3>Live meeting audio, end to end</h3>
+            <p>
+              For <strong>live meetings</strong>, Echo listens to both sides of the conversation: your microphone
+              and the audio the call plays into your headset or speakers. On macOS you can choose a simpler capture path
+              that pulls system output alongside your voice so remote attendees stay in the same transcript you hear.
+            </p>
+          </div>
+          <div class="showcase__mock">
+            <div class="echo-term echo-term--tilt-rev">
+              <div class="echo-term__titlebar">
+                <div class="echo-term__dots" aria-hidden="true"><span></span><span></span><span></span></div>
+                <div class="echo-term__title">Echo — live</div>
+              </div>
+              <div class="echo-term__body">
+                <div class="echo-pane">
+                  <div class="echo-pane__label">Transcript</div>
+                  <div class="echo-line echo-line--hi">…live meeting in progress</div>
+                  <div class="echo-line">Listening · your voice + call audio · updates as people speak</div>
+                </div>
+                <div class="echo-pane echo-pane--stack">
+                  <div class="echo-subpane">
+                    <div class="echo-pane__label">Insights</div>
+                    <div class="echo-line" style="font-size: 11px">Web search on cadence you configure</div>
+                  </div>
+                  <div class="echo-subpane">
+                    <div class="echo-pane__label">Chat</div>
+                    <div class="echo-line echo-line--tag">&gt; Summarize the last few minutes</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="section wrap" id="features">
+        <p class="section__eyebrow reveal">Why use Echo</p>
+        <h2 class="section__title reveal">A focused live meeting assistant, not another SaaS</h2>
+        <div class="feature-deck">
+          <article class="feature-card reveal">
+            <div class="feature-card__icon" aria-hidden="true">▣</div>
+            <h3>Live meetings first</h3>
+            <p>
+              The headline experience is the call you are in right now: capture audio as it happens, keep the
+              transcript moving, and let insights and chat stay tied to the same thread. Demo, replay, and saved-audio
+              modes remain for rehearsal, coaching, or offline review.
+            </p>
+          </article>
+          <article class="feature-card reveal">
+            <div class="feature-card__icon" aria-hidden="true">⌕</div>
+            <h3>Web context on a cadence</h3>
+            <p>Periodic search pulls in fresh articles, definitions, and public facts beside the meeting so you are not copy-pasting queries mid-call.</p>
+          </article>
+          <article class="feature-card reveal">
+            <div class="feature-card__icon" aria-hidden="true">✦</div>
+            <h3>Optional AI summaries</h3>
+            <p>Turn on short AI-generated highlights when you want them—keyword nudges, tight recaps, and richer answers in chat when you bring your own provider.</p>
+          </article>
+          <article class="feature-card reveal">
+            <div class="feature-card__icon" aria-hidden="true">⎘</div>
+            <h3>Keyboard-first workspace</h3>
+            <p>Jump between transcript, insights, and chat without reaching for the mouse—built for people who live in focused, text-forward environments.</p>
+          </article>
+          <article class="feature-card reveal">
+            <div class="feature-card__icon" aria-hidden="true">◆</div>
+            <h3>Quick connectivity check</h3>
+            <p>A lightweight command exercises the same search and AI paths as the assistant so you can confirm everything is reachable before an important call.</p>
+          </article>
+          <article class="feature-card reveal">
+            <div class="feature-card__icon" aria-hidden="true">◇</div>
+            <h3>Open for teams who build</h3>
+            <p>Fork, customize, and share improvements freely—ideal for experimentation, internal pilots, and teaching assistants in your own stack.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section section--privacy wrap" id="privacy">
+        <div class="privacy-panel reveal">
+          <h2>Your data stays yours</h2>
+          <p>
+            Echo is not a hosted meeting cloud: transcripts stay on the machine you run, web lookups only fire when you
+            enable them, and AI features stay off until you choose to connect a provider you trust.
+          </p>
+          <p>
+            Meeting audio stays local unless you deliberately send it to a transcription or AI service you configure. For
+            stricter rooms, read the project README for offline-friendly and timeout controls before going live.
+          </p>
+        </div>
+      </section>
+
+      <section class="section wrap" id="install">
+        <p class="section__eyebrow reveal">Developers &amp; curious operators</p>
+        <h2 class="section__title reveal">Clone, install, run</h2>
+        <div class="pre-block reveal">
+          <pre>git clone https://github.com/McK-Playground/prj-echo.git
+cd prj-echo
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+
+# Optional speech-to-text + live capture
+pip install -e ".[asr]"
+
+echo-tui
+echo-tui --replay samples/sample_transcript.txt --line-delay 0.8</pre>
+        </div>
+        <p class="section__footnote reveal">
+          Remember to launch <strong>echo-tui</strong> (or <span class="kbd">python -m echo</span>); the shell builtin
+          <span class="kbd">echo</span> only prints arguments. Full flags, environment variables, and macOS audio notes
+          live in the
+          <a href="https://github.com/McK-Playground/prj-echo/blob/main/README.md" target="_blank" rel="noopener noreferrer"
+            >README on GitHub</a
+          >.
+        </p>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="wrap site-footer__inner">
+        <div class="site-footer__brand">
+          <img src="./assets/echo-icon.svg" width="40" height="40" alt="" />
+          <div>
+            <strong>Echo</strong>
+            <p>Live meeting assistant—rolling transcript, web context, optional AI, and chat</p>
+          </div>
+        </div>
+        <div class="site-footer__links">
+          <a href="https://github.com/McK-Playground/prj-echo" target="_blank" rel="noopener noreferrer">GitHub</a>
+          <a href="https://github.com/McK-Playground/prj-echo/issues" target="_blank" rel="noopener noreferrer">Issues</a>
+          <a href="https://github.com/McK-Playground/prj-echo/blob/main/README.md" target="_blank" rel="noopener noreferrer">Docs</a>
+        </div>
+      </div>
+    </footer>
+
+    <script src="./main.js" defer></script>
+  </body>
+</html>
