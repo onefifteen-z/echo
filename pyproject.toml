@@ -1,0 +1,39 @@
+[project]
+name = "echo"
+version = "0.1.0"
+description = "Echo — meeting transcript + search + chat TUI demo"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "textual>=0.58.0",
+  "ddgs>=9.0.0",
+  "anthropic>=0.40.0",
+  "openai>=1.50.0",
+  "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+asr = [
+  "transformers>=4.39",
+  "accelerate>=0.30",
+  "torch",
+  "torchaudio",
+  "torchcodec>=0.10.0",
+  "soundfile",
+  "numpy>=1.22",
+]
+
+[project.scripts]
+echo-tui = "echo.__main__:main"
+echo-probe = "echo.probe:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["echo*"]

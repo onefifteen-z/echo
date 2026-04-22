@@ -1,0 +1,6 @@
+[00:00] Welcome everyone — today we align on Echo offline testing and milestones.
+[00:18] The offline replay path should mimic streaming so we can validate the UI without a microphone.
+[00:40] For retrieval, we will query DuckDuckGo using keywords extracted from the rolling buffer.
+[01:05] Action items: wire faster-whisper later, keep asyncio queues between workers, and debounce search.
+[01:28] Budget note: Q4 marketing spend is up 8% quarter-over-quarter; inventory costs are elevated.
+[01:55] Decision: ship the Textual demo first, then iterate on VAD boundaries and summarization cadence.
