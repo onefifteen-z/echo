@@ -56,10 +56,19 @@ def _agent_digest_for_prompt() -> str:
     return digest
 
 
-def _build_insight_route_prompt(snippet: str) -> str:
+def _build_insight_route_prompt(
+    snippet: str,
+    *,
+    segments: list[tuple[int, str]] | None = None,
+) -> str:
     agent = _agent_digest_for_prompt()
     core = INSIGHT_ROUTE_CORE.replace("<<<AGENT>>>", agent.strip())
-    return _embed_snippet(core, snippet)
+    prompt = _embed_snippet(core, snippet)
+    if not segments:
+        return prompt.replace("<<<SEGMENTS>>>", "(none)")
+    lines = [f"{sid}: {txt.strip()}" for sid, txt in segments if txt.strip()]
+    blob = "\n".join(lines) if lines else "(none)"
+    return prompt.replace("<<<SEGMENTS>>>", blob)
 
 
 def _strip_code_fence(text: str) -> str:
@@ -160,6 +169,7 @@ You route one meeting **transcript chunk** (may be imperfect ASR). Apply the dig
 Return ONLY valid JSON (no markdown code fences) with exactly these keys:
 - "action": either "comment" or "web_search"
 - "corrected_transcript": string — same content as the raw chunk with probable ASR/typo/word-boundary fixes; **same language**; **do not** add facts, numbers, or lines not clearly grounded in the chunk. If nothing needs fixing, return the raw chunk verbatim.
+- "corrected_segments": array of objects with shape {"id": number, "text": string}. Use ONLY ids listed below. Keep line boundaries: do not merge or split segments. "text" must be content-only (no timestamps). If no segment-level edits, return [].
 - "comment": string (markdown). If action is "comment": **very short** live-meeting insight per digest: **one** lead sentence (So what?) + **at most 2** bullets + **one** closing line (Now what?); **hard cap ~90 words** total—people are in a meeting. If action is "web_search": empty string "".
 - "search_query": string. If action is "web_search": concise keywords for a web search. If action is "comment": empty string "".
 - "reason": one short line explaining the routing choice.
@@ -172,6 +182,11 @@ Routing rules:
 Raw transcript chunk:
 <<<
 <<<SNIPPET>>>
+>>>
+
+Segment IDs (for structured correction mapping):
+<<<
+<<<SEGMENTS>>>
 >>>
 """
 
@@ -281,6 +296,7 @@ class InsightRouteResult:
     search_query: str
     reason: str
     corrected_transcript: str = ""
+    corrected_segments: list[tuple[int, str]] | None = None
 
 
 def _parse_insight_route_json(text: str) -> InsightRouteResult | None:
@@ -303,50 +319,74 @@ def _parse_insight_route_json(text: str) -> InsightRouteResult | None:
         or data.get("cleaned_transcript")
         or "",
     ).strip()
+    corrected_segments_raw = data.get("corrected_segments") or []
+    corrected_segments: list[tuple[int, str]] = []
+    if isinstance(corrected_segments_raw, list):
+        for row in corrected_segments_raw:
+            if not isinstance(row, dict):
+                continue
+            rid = row.get("id")
+            txt = row.get("text")
+            try:
+                sid = int(rid)
+            except (TypeError, ValueError):
+                continue
+            text_val = str(txt or "").strip()
+            if not text_val:
+                continue
+            corrected_segments.append((sid, text_val))
     return InsightRouteResult(
         action=action,
         comment=comment,
         search_query=search_query,
         reason=reason,
         corrected_transcript=corrected,
+        corrected_segments=corrected_segments,
     )
 
 
-async def llm_route_insight(transcript_snippet: str) -> InsightRouteResult:
+async def llm_route_insight(
+    transcript_snippet: str,
+    *,
+    segments: list[tuple[int, str]] | None = None,
+) -> InsightRouteResult:
     """Ask LLM to choose comment-only vs web_search. Without API keys, returns a comment explaining missing config."""
     snippet = transcript_snippet.strip()
     if not snippet:
         return InsightRouteResult("comment", "", "", "", "")
 
-    prompt = _build_insight_route_prompt(snippet)
+    prompt = _build_insight_route_prompt(snippet, segments=segments)
     raw = await _llm_user_text(prompt, 768)
     if not raw.strip():
         return InsightRouteResult(
             "comment",
-            "（未配置 LLM：设置 ANTHROPIC_API_KEY、OPENAI_API_KEY，或 BASE_URL + API_KEY + MODEL；"
-            "无法自动在「评论 / 联网检索」之间路由。）",
+            "(LLM not configured: set ANTHROPIC_API_KEY, OPENAI_API_KEY, "
+            "or BASE_URL + API_KEY + MODEL; routing between comment and web search is disabled.)",
             "",
             "no_llm",
             snippet,
+            [],
         )
 
     parsed = _parse_insight_route_json(raw)
     if parsed is None:
         return InsightRouteResult(
             "comment",
-            f"_路由 JSON 无法解析，原文片段：_\n\n```\n{raw[:1200]}\n```",
+            f"_Routing JSON could not be parsed. Raw model output:_\n\n```\n{raw[:1200]}\n```",
             "",
             "parse_error",
             snippet,
+            [],
         )
 
     if parsed.action == "comment" and not parsed.comment:
         parsed = InsightRouteResult(
             "comment",
-            "_模型选择了 comment 但未输出正文。_",
+            "_Model selected `comment` but returned no body text._",
             "",
             parsed.reason or "empty_comment",
             parsed.corrected_transcript or snippet,
+            parsed.corrected_segments or [],
         )
     if parsed.action == "web_search" and not parsed.search_query:
         kws = extract_keywords_fallback(snippet)
@@ -357,6 +397,7 @@ async def llm_route_insight(transcript_snippet: str) -> InsightRouteResult:
             q,
             (parsed.reason + " · " if parsed.reason else "") + "filled_empty_query",
             parsed.corrected_transcript or snippet,
+            parsed.corrected_segments or [],
         )
 
     final_ct = (parsed.corrected_transcript or "").strip() or snippet
@@ -366,6 +407,7 @@ async def llm_route_insight(transcript_snippet: str) -> InsightRouteResult:
         parsed.search_query,
         parsed.reason,
         final_ct,
+        parsed.corrected_segments or [],
     )
 
 
@@ -381,7 +423,7 @@ async def llm_synthesize_web_findings(
     text = await _llm_user_text(prompt, 512)
     if not text.strip():
         return (
-            "_（未返回正文：检查 LLM 配置或重试。以下为检索摘录。）_\n\n"
+            "_(No summary text returned by LLM; check configuration or retry. Search excerpts below.)_\n\n"
             f"**Query:** `{query}`\n\n{_hits_bullets(hits)}"
         )
     return text
@@ -402,8 +444,8 @@ async def llm_keywords_and_summary(transcript_snippet: str) -> tuple[list[str], 
 
     kws = extract_keywords_fallback(snippet)
     summary = (
-        "（未配置 LLM：设置 ANTHROPIC_API_KEY，或 OPENAI_API_KEY，"
-        "或 LiteLLM 风格 BASE_URL + API_KEY + MODEL；当前为简单关键词抽取）"
+        "(LLM not configured: set ANTHROPIC_API_KEY, OPENAI_API_KEY, "
+        "or LiteLLM-style BASE_URL + API_KEY + MODEL; using heuristic keywords only.)"
     )
     return kws, summary
 
@@ -416,9 +458,9 @@ async def llm_chat_answer(full_transcript: str, question: str) -> str:
     if key := os.environ.get("OPENAI_API_KEY"):
         return await _openai_chat(key, full_transcript, question)
     return (
-        "未检测到 API Key。请设置 ANTHROPIC_API_KEY、OPENAI_API_KEY，"
-        "或 LiteLLM 风格 BASE_URL + API_KEY + MODEL。\n"
-        f"当前转写长度: {len(full_transcript)} 字符。"
+        "No API key detected. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, "
+        "or LiteLLM-style BASE_URL + API_KEY + MODEL.\n"
+        f"Current transcript length: {len(full_transcript)} chars."
     )
 
 

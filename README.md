@@ -1,5 +1,16 @@
 # Echo
 
+<p align="center">
+  <img src="echo-icon.svg" alt="Echo icon" width="108" />
+</p>
+
+<p align="center">
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" />
+  <img alt="Built with Textual" src="https://img.shields.io/badge/TUI-Textual-5A48F5" />
+  <img alt="ASR Kotoba Whisper v2.2" src="https://img.shields.io/badge/ASR-kotoba--whisper--v2.2-FFB020" />
+  <img alt="Live audio mode" src="https://img.shields.io/badge/Live-mic%20%2B%20system-2EA043" />
+</p>
+
 Echo is a **terminal (TUI) demo** for meeting-style workflows: live-ish transcript, periodic **web search** via the **[`ddgs`](https://pypi.org/project/ddgs/)** metasearch library (DuckDuckGo / Bing / … backends), plus optional **LLM** summaries, and a bottom **chat** panel for questions over the transcript.
 
 Built with [Textual](https://textual.textualize.io/).
@@ -10,10 +21,11 @@ Built with [Textual](https://textual.textualize.io/).
 - **Transcript panel**: timed lines as they arrive.
 - **Insights panel**: keywords, web hits, and a short summary (LLM optional).
 - **Chat panel**: ask questions with full transcript as context (LLM optional).
-- **Three input modes**:
+- **Four input modes**:
   1. Built-in demo lines (no flags).
   2. `--replay` a UTF-8 text file (simulated streaming).
   3. `--audio` a local file transcribed with **[Kotoba-Whisper v2.2](https://huggingface.co/kotoba-tech/kotoba-whisper-v2.2)** weights via Transformers (see below).
+  4. **`--live`** real-time capture from the **microphone** plus an optional **second PortAudio input** (often a virtual loopback such as [BlackHole](https://github.com/ExistentialAudio/BlackHole) on macOS—**not required**; see **Zoom without BlackHole** below). Both paths are resampled to **16 kHz mono**; when two devices are set, Echo **mixes them 50/50** before ASR. List devices with `echo-tui --list-audio-devices`.
 
 ## Requirements
 
@@ -37,7 +49,7 @@ ASR uses PyTorch + Transformers + Torchaudio. Install the extra group:
 pip install -e ".[asr]"
 ```
 
-The `[asr]` extra includes **torchcodec**, which recent **torchaudio** builds use to decode **MP3** and many other formats. **ffmpeg** should be on your `PATH` (e.g. `brew install ffmpeg` on macOS). If TorchCodec is awkward to install, `pip install librosa` is enough for Echo’s **librosa fallback** when torchaudio fails.
+The `[asr]` extra includes **torchcodec**, which recent **torchaudio** builds use to decode **MP3** and many other formats. **ffmpeg** should be on your `PATH` (e.g. `brew install ffmpeg` on macOS). If TorchCodec is awkward to install, `pip install librosa` is enough for Echo’s **librosa fallback** when torchaudio fails. **Live capture** also needs **`sounddevice`** (included in `[asr]`).
 
 First run downloads model weights from Hugging Face (large download; size depends on dtype/device).
 
@@ -58,6 +70,13 @@ echo-tui --replay samples/sample_transcript.txt --line-delay 0.8
 
 # Transcribe a local audio file (wav / mp3 / flac / …)
 echo-tui --audio path/to/meeting.wav
+
+# Live: mic + second input (e.g. loopback device index from --list-audio-devices)
+echo-tui --list-audio-devices
+echo-tui --live --live-mic-device 0 --live-system-device 2 --chunk-seconds 5
+
+# Live without BlackHole: use bundled ScreenCaptureKit helper + mic
+echo-tui --live --live-system-authorized
 
 # ASR options
 echo-tui --audio meeting.wav --chunk-seconds 30 --model-id kotoba-tech/kotoba-whisper-v2.2
@@ -97,12 +116,59 @@ Loads the same `.env` rules as the app (repo root then cwd), prints which LLM ro
 | `ECHO_INSIGHT_DDG_TIMEOUT` | Seconds for each ddgs web search in insights (default `45`). |
 | `ECHO_DDGS_BACKEND` | Metasearch backend for the `ddgs` library: `auto` (default), `bing`, `duckduckgo`, `yahoo`, … (see [ddgs docs](https://pypi.org/project/ddgs/)). If unset and `auto` returns nothing, Echo tries `bing`, then `duckduckgo`, then `yahoo`. |
 | `ECHO_NO_SPLASH` | Set to `1` / `true` / `yes` to skip the green ASCII **ECHO** startup splash (e.g. for automation). |
+| `ECHO_WHISPER_LANGUAGE` | Whisper `language=` for forced decoder ids (default `japanese` for Kotoba). Set e.g. `english` for other models. |
+| `ECHO_OFFLINE` / `ECHO_ASSUME_ONLINE` / `ECHO_HF_LOCAL_ONLY` | See **Offline / LLM reachability** below. |
+| `ECHO_SYSTEM_AUDIO_CMD` | Override command for `--live-system-authorized` (if `--live-system-authorized-cmd` is omitted). Built-in default auto-compiles a bundled ScreenCaptureKit helper on macOS. Custom command must output `s16le`, 24kHz, stereo PCM to stdout. |
 
 `API_KEY` / `MODEL` are generic names—keep Echo’s `.env` dedicated to this app or use a separate file / shell exports so they do not clash with other tools.
 
 If the **Insights** panel stays on “Updating…”, it was usually a **hung or failing LLM/search request** with no UI recovery (now fixed: timeouts + error text). Check `BASE_URL` / keys, corporate proxy, or search rate limits; try `ECHO_DDGS_BACKEND=bing`; increase timeouts via the env vars above if needed.
 
 If no LLM configuration is detected, Echo still runs: keywords use a small heuristic, summaries note that LLM is off, and chat replies tell you to set a key.
+
+### Offline / LLM reachability
+
+- On startup Echo **TCP-probes the configured LLM host** (Anthropic, OpenAI, or your `BASE_URL`). If that fails—or no API keys are set—**Insights and chat are disabled**, but **Transcript** (replay, file ASR, or `--live`) still runs.
+- **`ECHO_ASSUME_ONLINE=1`**: skip the LLM probe (useful on split-tunnel / internal-only API routes).
+- **`ECHO_OFFLINE=1`**: force local Hugging Face cache for weights and treat the LLM as unavailable.
+- **`ECHO_HF_LOCAL_ONLY=1`**: load ASR weights from disk only (no Hub download) without forcing the LLM offline probe to fail.
+
+### Live audio (macOS)
+
+#### Option A — second *input* device (e.g. BlackHole / Loopback)
+
+macOS does not expose “what Zoom plays to your speakers” as a microphone. A **second input** is usually a **virtual loopback** (BlackHole, or paid tools such as **Loopback**—same idea, different vendor).
+
+1. Route Zoom’s **speaker** output through that loopback (often via a **Multi-Output Device** in Audio MIDI Setup: built-in speakers + loopback).
+2. `echo-tui --list-audio-devices` → pick **mic** + **loopback** indices or name substrings.
+3. `echo-tui --live --live-mic-device … --live-system-device …`  
+   Or build an **Aggregate Device** (mic + loopback) and pass **only** `--live-mic-device` to that aggregate.
+
+Echo does **not** ship or install audio drivers.
+
+#### Option B — Zoom **without** BlackHole (system authorization mode)
+
+Echo supports a real-time path that mixes:
+
+- microphone from `sounddevice`, and
+- system output from a command that uses **ScreenCaptureKit** authorization (Screen Recording).
+
+By default, Echo auto-builds and runs a bundled helper (`echo/macos/SystemAudioCapture.swift`) on first use. It requests Screen Recording permission and writes `s16le` stereo PCM @ 24kHz to stdout.
+
+1. Run Echo live mode:
+   `echo-tui --live --live-system-authorized`
+2. macOS prompts for **Screen Recording** permission (and microphone for your terminal app if not granted yet). Approve both.
+3. Optional: provide your own command instead of the bundled helper:
+   `echo-tui --live --live-system-authorized --live-system-authorized-cmd "/path/to/cmd"`
+4. Optional persistent override:
+   `export ECHO_SYSTEM_AUDIO_CMD="/path/to/cmd"`
+
+Notes:
+
+- `--live-system-authorized` cannot be combined with `--live-system-device`.
+- If helper build or system capture startup fails, Echo shows a startup error in Transcript.
+
+Fallback (always works, no real-time requirements): Zoom/QuickTime recording → `echo-tui --audio file`.
 
 ### `.env` (python-dotenv)
 
@@ -149,6 +215,8 @@ echo/
   __main__.py   # CLI
   splash.py     # ASCII ECHO startup modal
   app.py        # Textual UI + workers
+  live_audio.py # sounddevice capture (mic + optional loopback)
+  macos/SystemAudioCapture.swift  # bundled ScreenCaptureKit helper for --live-system-authorized
   asr.py        # Kotoba-Whisper weights, chunked inference
   llm.py        # Optional Anthropic / OpenAI + fallbacks
   search.py     # DuckDuckGo (threaded)

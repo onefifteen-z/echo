@@ -28,7 +28,7 @@ def _require_asr_deps() -> None:
         import transformers  # noqa: F401
     except ImportError as e:
         raise RuntimeError(
-            "缺少 ASR 依赖。请安装: pip install -e '.[asr]'"
+            "ASR dependencies missing. Install: pip install -e '.[asr]'"
         ) from e
 
 
@@ -166,21 +166,21 @@ def ensure_model_loaded(model_id: str = MODEL_ID_DEFAULT, device: str | None = N
         except OSError as e:
             if _exception_chain_mentions_tls(e):
                 raise OSError(
-                    "从 Hugging Face 拉取模型时出现 TLS/证书错误（常见于公司代理或自签证书）。\n"
-                    "可选处理方式：\n"
-                    "  1) 将企业根 CA 合并为 PEM，并设置其一：\n"
+                    "TLS / certificate error while contacting Hugging Face (common behind corporate proxies).\n"
+                    "Options:\n"
+                    "  1) Merge your corporate root CA into a PEM bundle and set one of:\n"
                     "       export ECHO_HF_CA_BUNDLE=/path/to/combined.pem\n"
-                    "     或 export SSL_CERT_FILE=... / REQUESTS_CA_BUNDLE=...\n"
-                    "  2) 仅在可信网络下临时跳过校验：\n"
+                    "       export SSL_CERT_FILE=...  or  REQUESTS_CA_BUNDLE=...\n"
+                    "  2) As a last resort on a trusted network:\n"
                     "       export ECHO_HF_INSECURE_SSL=1\n"
-                    f"原始错误: {e}"
+                    f"Underlying error: {e}"
                 ) from e
             if local_only:
                 raise OSError(
-                    "当前为仅本地加载（无网络或已设置 ECHO_HF_LOAD_LOCAL_ONLY / HF_HUB_OFFLINE），"
-                    "但缓存中未找到完整模型文件。\n"
-                    "请先在有网络时运行一次以下载权重，或设置 HF_HOME 指向已缓存该模型的目录。\n"
-                    f"原始错误: {e}"
+                    "Local-only Hub load is enabled (ECHO_HF_LOAD_LOCAL_ONLY / HF_HUB_OFFLINE / ECHO_OFFLINE), "
+                    "but the full model snapshot is not present in the cache.\n"
+                    "Run once online to download weights, or point HF_HOME at a cache that already contains this model.\n"
+                    f"Underlying error: {e}"
                 ) from e
             raise
         mdl.eval()
@@ -223,15 +223,15 @@ def _load_audio_mono_16k(path: Path):
                 return _from_librosa()
             except ImportError as ie:
                 raise RuntimeError(
-                    "当前 torchaudio 解码该文件需要 TorchCodec。请安装：pip install torchcodec\n"
-                    "并确保系统 PATH 中有 ffmpeg（MP3 等格式需要）。\n"
-                    "若不便安装 TorchCodec，可改用：pip install librosa\n"
-                    f"原始错误: {e}"
+                    "This torchaudio build needs TorchCodec for this file. Install: pip install torchcodec\n"
+                    "and ensure ffmpeg is on your PATH (needed for MP3 and many formats).\n"
+                    "Alternatively: pip install librosa\n"
+                    f"Original error: {e}"
                 ) from ie
             except Exception as e2:  # noqa: BLE001
                 raise RuntimeError(
-                    "torchaudio 解码失败；已尝试 librosa 回退仍失败。\n"
-                    "请安装 torchcodec + ffmpeg，或单独用 librosa 能成功加载该文件后再试。\n"
+                    "torchaudio decode failed; librosa fallback also failed.\n"
+                    "Install torchcodec + ffmpeg, or verify librosa can load this file standalone.\n"
                     f"torchaudio: {e}\nlibrosa: {e2}"
                 ) from e2
         raise
@@ -242,6 +242,35 @@ def format_timestamp_hms(seconds: float) -> str:
     h, r = divmod(t, 3600)
     m, s = divmod(r, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def transcribe_mono16k_chunk(
+    samples: "object",
+    *,
+    model_id: str = MODEL_ID_DEFAULT,
+    device: str | None = None,
+    language: str = "japanese",
+) -> str:
+    """Decode one mono float32 chunk at 16 kHz (Whisper). Returns empty string if too short."""
+    import numpy as np
+    import torch
+
+    x = np.asarray(samples, dtype=np.float32).reshape(-1)
+    if x.size < int(0.25 * 16000):
+        return ""
+
+    dev, processor, model = ensure_model_loaded(model_id, device)
+    forced_decoder_ids = processor.get_decoder_prompt_ids(language=language, task="transcribe")
+    dtype = next(model.parameters()).dtype
+    inputs = processor(x, sampling_rate=16000, return_tensors="pt")
+    feats = inputs.input_features.to(dev, dtype=dtype)
+    with torch.no_grad():
+        pred_ids = model.generate(
+            feats,
+            forced_decoder_ids=forced_decoder_ids,
+            max_new_tokens=_whisper_max_new_tokens(model, forced_decoder_ids),
+        )
+    return processor.batch_decode(pred_ids, skip_special_tokens=True)[0].strip()
 
 
 def _whisper_max_new_tokens(model: object, forced_decoder_ids: list | None) -> int:
@@ -286,19 +315,12 @@ class TranscribeSession:
         if chunk.size < int(0.25 * self._sr):
             return None
 
-        dev, processor, model = ensure_model_loaded(self._model_id, self._device)
-
-        forced_decoder_ids = processor.get_decoder_prompt_ids(language="japanese", task="transcribe")
-        dtype = next(model.parameters()).dtype
-        inputs = processor(chunk, sampling_rate=self._sr, return_tensors="pt")
-        feats = inputs.input_features.to(dev, dtype=dtype)
-        with torch.no_grad():
-            pred_ids = model.generate(
-                feats,
-                forced_decoder_ids=forced_decoder_ids,
-                max_new_tokens=_whisper_max_new_tokens(model, forced_decoder_ids),
-            )
-        text = processor.batch_decode(pred_ids, skip_special_tokens=True)[0].strip()
+        text = transcribe_mono16k_chunk(
+            chunk,
+            model_id=self._model_id,
+            device=self._device,
+            language="japanese",
+        )
         self._index += 1
         return (start / self._sr, end / self._sr, text)
 

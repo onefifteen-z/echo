@@ -23,6 +23,7 @@ asr = [
   "torchaudio",
   "torchcodec>=0.10.0",
   "soundfile",
+  "sounddevice>=0.5.0",
   "numpy>=1.22",
 ]
 
@@ -37,3 +38,6 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["echo*"]
+
+[tool.setuptools.package-data]
+echo = ["macos/*.swift"]
