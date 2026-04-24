@@ -117,6 +117,17 @@ Loads the same `.env` rules as the app (repo root then cwd), prints which LLM ro
 | `ECHO_DDGS_BACKEND` | Metasearch backend for the `ddgs` library: `auto` (default), `bing`, `duckduckgo`, `yahoo`, … (see [ddgs docs](https://pypi.org/project/ddgs/)). If unset and `auto` returns nothing, Echo tries `bing`, then `duckduckgo`, then `yahoo`. |
 | `ECHO_NO_SPLASH` | Set to `1` / `true` / `yes` to skip the green ASCII **ECHO** startup splash (e.g. for automation). |
 | `ECHO_WHISPER_LANGUAGE` | Whisper `language=` for forced decoder ids (default `japanese` for Kotoba). Set e.g. `english` for other models. |
+| `ECHO_LIVE_EMIT_INTERVAL` | Legacy batch mode knob for live transcript flushing. `0` (default) keeps Echo in append-draft mode and uses semantic/pause/length segmentation rules. Positive values switch to interval batching. |
+| `ECHO_LIVE_SEGMENT_PAUSE_SECONDS` | Main live UI segmentation trigger: finalize current draft when silence reaches this threshold (default `2.0`). |
+| `ECHO_UI_SEGMENT_SEMANTIC_MIN_CHARS` | Minimum chars required before sentence-ending punctuation can finalize a segment (default `80`). |
+| `ECHO_UI_SEGMENT_MAX_SECONDS` | Forced UI segment split when a draft grows too long in time (default `25`). |
+| `ECHO_UI_SEGMENT_MAX_CHARS` | Forced UI segment split when a draft grows too long in text length (default `360`). |
+| `ECHO_INSIGHT_LIVE_MIN_SECONDS` | Live insight auxiliary trigger on newly added transcript duration (default `10`). |
+| `ECHO_INSIGHT_PAUSE_SECONDS` | Live idle-window trigger for insight evaluation (default `3`). |
+| `ECHO_INSIGHT_PAUSE_MIN_CHARS` | Minimum new chars required when triggering insights from idle pause (default `80`). |
+| `ECHO_INSIGHT_FINALIZED_SEGMENT_MIN_CHARS` | Minimum chars for a newly finalized segment to trigger insight directly (default `100`). |
+| `ECHO_INSIGHT_SKIP_MIN_CHARS` | Skip insight calls when new content is below this size (default `50`). |
+| `ECHO_INSIGHT_LIVE_MIN_INTERVAL` | Global live insight rate limiter in seconds (default `20`). |
 | `ECHO_OFFLINE` / `ECHO_ASSUME_ONLINE` / `ECHO_HF_LOCAL_ONLY` | See **Offline / LLM reachability** below. |
 | `ECHO_SYSTEM_AUDIO_CMD` | Override command for `--live-system-authorized` (if `--live-system-authorized-cmd` is omitted). Built-in default auto-compiles a bundled ScreenCaptureKit helper on macOS. Custom command must output `s16le`, 24kHz, stereo PCM to stdout. |
 
@@ -146,6 +157,15 @@ macOS does not expose “what Zoom plays to your speakers” as a microphone. A 
 
 Echo does **not** ship or install audio drivers.
 
+In `--live` default mode (`ECHO_LIVE_EMIT_INTERVAL=0`), Transcript keeps one mutable draft line and finalizes it when one of these happens:
+
+- pause reaches `ECHO_LIVE_SEGMENT_PAUSE_SECONDS` (primary trigger),
+- sentence-ending punctuation is seen and draft length reaches `ECHO_UI_SEGMENT_SEMANTIC_MIN_CHARS`,
+- draft exceeds `ECHO_UI_SEGMENT_MAX_SECONDS` or `ECHO_UI_SEGMENT_MAX_CHARS` (forced split).
+
+Insights consume only new live content since the previous call and trigger on new chars / newly finalized segment / new duration / idle pause, with `ECHO_INSIGHT_LIVE_MIN_INTERVAL` as a hard rate limit.
+For debugging, Echo writes live debug events to `./log/echo_live_<timestamp>.log` (created from your launch directory).
+
 #### Option B — Zoom **without** BlackHole (system authorization mode)
 
 Echo supports a real-time path that mixes:
@@ -153,16 +173,13 @@ Echo supports a real-time path that mixes:
 - microphone from `sounddevice`, and
 - system output captured by a bundled macOS helper.
 
-By default, Echo auto-builds and runs `echo/macos/SystemAudioCapture.swift` on first use. The helper writes `s16le` stereo PCM @ 24kHz to stdout and chooses the **least invasive** permission path available:
-
-1. **macOS 14.2+ (preferred): Core Audio process tap.** Triggers only the **System Audio Recording Only** prompt — no Screen Recording required. Echo creates a private global tap + aggregate device under the hood.
-2. **Fallback: ScreenCaptureKit.** Used when the tap path is unavailable or denied. Requires the broader **Screen Recording** permission.
+By default, Echo auto-builds and runs `echo/macos/SystemAudioCapture.swift` on first use. The helper writes `s16le` stereo PCM @ 24kHz to stdout and uses **ScreenCaptureKit** by default (requires **Screen Recording** permission).
 
 Steps:
 
 1. Run Echo live mode:
    `echo-tui --live --live-system-authorized`
-2. Approve the macOS prompt (microphone for your terminal app if not granted yet). On macOS 14.2+ this is **System Audio Recording Only**; on older macOS it is **Screen Recording**.
+2. Approve the macOS prompt (microphone for your terminal app if not granted yet). For system output capture, grant **Screen Recording** permission.
 3. Optional: provide your own command instead of the bundled helper:
    `echo-tui --live --live-system-authorized --live-system-authorized-cmd "/path/to/cmd"`
 4. Optional persistent override:
@@ -172,7 +189,7 @@ Notes:
 
 - `--live-system-authorized` cannot be combined with `--live-system-device`.
 - If helper build or system capture startup fails, Echo shows a startup error in Transcript.
-- To force the ScreenCaptureKit fallback (e.g. for debugging), set `ECHO_DISABLE_AUDIO_TAP=1` before launching.
+- Optional advanced path: on macOS 14.2+, set `ECHO_ENABLE_AUDIO_TAP=1` to opt into the Core Audio process-tap mode (System Audio Recording Only).
 
 Fallback (always works, no real-time requirements): Zoom/QuickTime recording → `echo-tui --audio file`.
 

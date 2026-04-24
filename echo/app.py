@@ -47,9 +47,13 @@ class TranscriptSegment:
     spoken_text: str
     stable_after: float
     allow_correction: bool
+    finalized: bool = True
 
 
 _LEADING_BRACKET_TS = re.compile(r"^(\[[^\]]+\]\s*)")
+_LIVE_LINE_SPAN_RE = re.compile(
+    r"^\[(\d{2}):(\d{2}):(\d{2})[–-](\d{2}):(\d{2}):(\d{2})\]"
+)
 _LIVE_SENTENCE_END_RE = re.compile(r"[。！？!?]+$")
 _LIVE_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?])\s*")
 _LIVE_CLAUSE_SPLIT_RE = re.compile(r"(?<=[、，,;；])\s*")
@@ -76,6 +80,16 @@ def _leading_ts_prefix(line: str) -> str:
 
 def _strip_leading_ts(line: str) -> str:
     return _LEADING_BRACKET_TS.sub("", line, count=1).strip()
+
+
+def _line_span_seconds(line: str) -> tuple[float, float] | None:
+    m = _LIVE_LINE_SPAN_RE.match(line)
+    if not m:
+        return None
+    h0, m0, s0, h1, m1, s1 = (int(x) for x in m.groups())
+    t0 = float((h0 * 3600) + (m0 * 60) + s0)
+    t1 = float((h1 * 3600) + (m1 * 60) + s1)
+    return t0, t1
 
 
 def _normalize_spaces(text: str) -> str:
@@ -176,6 +190,28 @@ def _meter_bar(unit: float, width: int = _METER_BAR_WIDTH) -> str:
     return "#" * filled + "-" * (width - filled)
 
 
+def _meter_bar_markup(unit: float, width: int = _METER_BAR_WIDTH) -> str:
+    """Color meter bars: green -> yellow -> orange -> red."""
+    v = max(0.0, min(1.0, float(unit)))
+    filled = int(round(v * width))
+    out: list[str] = []
+    for i in range(width):
+        if i >= filled:
+            out.append("[#5f5f5f]-[/]")
+            continue
+        pos = (i + 1) / max(1, width)
+        if pos <= 0.6:
+            color = "green"
+        elif pos <= 0.8:
+            color = "yellow"
+        elif pos <= 0.9:
+            color = "orange3"
+        else:
+            color = "red"
+        out.append(f"[{color}]#[/]")
+    return "".join(out)
+
+
 def _fmt_db(db: float) -> str:
     if db <= -119.0:
         return "-inf"
@@ -204,7 +240,7 @@ def _meter_vertical_chart(
     width: int = _METER_HISTORY_WIDTH,
     rows: int = _METER_CHART_ROWS,
 ) -> list[str]:
-    """Render a vertical equalizer-like chart (bottom darker, top lighter)."""
+    """Render a vertical equalizer-like chart with level colors."""
     if width <= 0 or rows <= 0:
         return []
     tail = units[-width:]
@@ -214,13 +250,18 @@ def _meter_vertical_chart(
 
     out: list[str] = []
     for r in range(rows, 0, -1):
-        if r <= rows // 3:
-            blk = "█"
-        elif r <= (rows * 2) // 3:
-            blk = "▓"
+        level = r / max(1, rows)
+        if level >= 0.85:
+            color = "red"
+        elif level >= 0.65:
+            color = "orange3"
+        elif level >= 0.45:
+            color = "yellow"
         else:
-            blk = "▒"
-        line = " ".join(blk if h >= r else " " for h in heights).rstrip()
+            color = "green"
+        filled = f"[{color}]█[/] "
+        empty = "  "
+        line = "".join(filled if h >= r else empty for h in heights).rstrip()
         out.append(line)
     return out
 
@@ -261,16 +302,54 @@ def _passes_live_voice_gate(
 
 def _should_trigger_insight_live(
     *,
-    eligible_segments: int,
+    new_chars: int,
+    new_seconds: float,
+    new_finalized_segments: int,
+    max_finalized_segment_chars: int,
     idle_tick: bool,
     idle_for: float,
-    min_segments: int,
+    min_chars: int,
+    min_seconds: float,
+    pause_min_chars: int,
+    finalized_segment_min_chars: int,
+    skip_min_chars: int,
     pause_seconds: float,
 ) -> tuple[bool, str]:
-    if eligible_segments <= 0:
+    if new_chars < max(1, skip_min_chars):
         return False, ""
-    if eligible_segments >= max(1, min_segments):
-        return True, "segment_count"
+    if new_chars >= max(1, min_chars):
+        return True, "char_count"
+    if (
+        new_finalized_segments >= 1
+        and max_finalized_segment_chars >= max(1, finalized_segment_min_chars)
+    ):
+        return True, "new_segment"
+    if new_seconds >= max(0.1, min_seconds):
+        return True, "duration"
+    if (
+        idle_tick
+        and idle_for >= max(0.0, pause_seconds)
+        and new_chars >= max(1, pause_min_chars)
+    ):
+        return True, "pause"
+    return False, ""
+
+
+def _should_flush_live_pending(
+    *,
+    has_pending: bool,
+    pending_duration: float,
+    idle_tick: bool,
+    idle_for: float,
+    pause_seconds: float,
+    emit_interval: float,
+) -> tuple[bool, str]:
+    if not has_pending:
+        return False, ""
+    if emit_interval <= 0.0:
+        return True, "immediate"
+    if pending_duration >= emit_interval:
+        return True, "interval"
     if idle_tick and idle_for >= max(0.0, pause_seconds):
         return True, "pause"
     return False, ""
@@ -455,6 +534,7 @@ class EchoApp(App[None]):
         ("p", "toggle_pause", "Pause"),
         ("s", "save_transcript", "Save"),
         ("c", "clear_chat", "Clear chat"),
+        ("r", "reset", "Reset"),
         ("i", "focus_insights", "Insights"),
         ("t", "focus_transcript", "Transcript"),
         ("q", "quit", "Quit"),
@@ -492,7 +572,7 @@ class EchoApp(App[None]):
         self.live_system_device = live_system_device
         self.live_system_authorized = live_system_authorized
         self.live_system_authorized_cmd = live_system_authorized_cmd
-        self.live_emit_interval = max(2.0, live_emit_interval)
+        self.live_emit_interval = max(0.0, live_emit_interval)
         self.live_group_delay = max(0.0, live_group_delay)
         self.live_group_chars = max(12, live_group_chars)
         if live_stop_words is None:
@@ -510,8 +590,10 @@ class EchoApp(App[None]):
         self._paused = False
         self._t0 = time.monotonic()
         self._lines: list[str] = []
+        self._line_ids: list[int] = []
         self._line_id_to_index: dict[int, int] = {}
         self._line_id_to_spoken: dict[int, str] = {}
+        self._line_id_to_flushed: dict[int, bool] = {}
         self._next_line_id = 1
         self._transcript_log_prefix: list[str] = []
         self._transcript_queue: asyncio.Queue[object] = asyncio.Queue()
@@ -521,6 +603,7 @@ class EchoApp(App[None]):
         self._insight_lock = asyncio.Lock()
         self._eof_sentinel = "__ECHO_EOF__"
         self._insight_passes: list[InsightPassRecord] = []
+        self._force_live_insight_flush = False
         self._live_meter_rms = 0.0
         self._live_meter_peak = 0.0
         self._live_meter_last_signal_at = 0.0
@@ -555,24 +638,69 @@ class EchoApp(App[None]):
             0.0,
             float(os.environ.get("ECHO_LIVE_CHUNK_OVERLAP_SECONDS", "0.5")),
         )
+        self.live_segment_pause_seconds = max(
+            0.3,
+            float(os.environ.get("ECHO_LIVE_SEGMENT_PAUSE_SECONDS", "2.0")),
+        )
+        self.live_overlap_min_chars = max(
+            1,
+            int(os.environ.get("ECHO_LIVE_OVERLAP_MIN_CHARS", "2")),
+        )
         self.live_rewrite_stable_seconds = max(
             0.0,
             float(os.environ.get("ECHO_LIVE_REWRITE_STABLE_SECONDS", "10.0")),
         )
-        self.insight_min_segments = max(
+        self.ui_segment_semantic_min_chars = max(
             1,
-            int(os.environ.get("ECHO_INSIGHT_MIN_SEGMENTS", "4")),
+            int(os.environ.get("ECHO_UI_SEGMENT_SEMANTIC_MIN_CHARS", "80")),
+        )
+        self.ui_segment_max_seconds = max(
+            4.0,
+            float(os.environ.get("ECHO_UI_SEGMENT_MAX_SECONDS", "25.0")),
+        )
+        self.ui_segment_max_chars = max(
+            80,
+            int(os.environ.get("ECHO_UI_SEGMENT_MAX_CHARS", "360")),
+        )
+        self.insight_live_min_seconds = max(
+            0.5,
+            float(os.environ.get("ECHO_INSIGHT_LIVE_MIN_SECONDS", "10.0")),
+        )
+        self.insight_pause_min_chars = max(
+            1,
+            int(os.environ.get("ECHO_INSIGHT_PAUSE_MIN_CHARS", "80")),
+        )
+        self.insight_finalized_segment_min_chars = max(
+            1,
+            int(os.environ.get("ECHO_INSIGHT_FINALIZED_SEGMENT_MIN_CHARS", "100")),
+        )
+        self.insight_skip_min_chars = max(
+            1,
+            int(os.environ.get("ECHO_INSIGHT_SKIP_MIN_CHARS", "50")),
         )
         self.insight_pause_seconds = max(
             0.2,
-            float(os.environ.get("ECHO_INSIGHT_PAUSE_SECONDS", "2.2")),
+            float(os.environ.get("ECHO_INSIGHT_PAUSE_SECONDS", "3.0")),
+        )
+        self.insight_live_min_interval = max(
+            0.5,
+            float(os.environ.get("ECHO_INSIGHT_LIVE_MIN_INTERVAL", "20.0")),
         )
         self.debug_event_limit = max(
             6,
             int(os.environ.get("ECHO_DEBUG_PANEL_LINES", "14")),
         )
         self._debug_events: list[str] = []
+        self._debug_log_path: Path | None = None
+        self._last_min_interval_debug_at = 0.0
+        try:
+            log_dir = Path.cwd() / "log"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            self._debug_log_path = log_dir / f"echo_live_{int(time.time())}.log"
+        except Exception:
+            self._debug_log_path = None
         self._last_silence_debug_at = 0.0
+        self._last_live_emitted_spoken = ""
 
     def _elapsed_hms(self) -> str:
         dt = timedelta(seconds=int(time.monotonic() - self._t0))
@@ -586,7 +714,7 @@ class EchoApp(App[None]):
         yield Header(show_clock=True)
         with Horizontal(id="main_row"):
             with Vertical(id="left_column"):
-                yield Static(self._input_meter_text(), id="input_meter", markup=False)
+                yield Static(self._input_meter_text(), id="input_meter", markup=True)
                 yield Static(self._live_preview_view(), id="live_preview", markup=False)
                 yield Static(self._debug_panel_text(), id="debug_panel", markup=False)
                 yield RichLog(
@@ -636,7 +764,7 @@ class EchoApp(App[None]):
         else:
             mode = "Text replay"
         off = " · no LLM" if self._llm_offline else ""
-        self.sub_title = f"🎙 {mode}{off}  [{self._elapsed_hms()}]  p/s/c/q"
+        self.sub_title = f"🎙 {mode}{off}  [{self._elapsed_hms()}]  p/s/c/r/q"
         self.set_interval(1.0, self._tick_header)
         self.set_interval(0.15, self._tick_input_meter)
         self.set_interval(0.12, self._tick_live_preview)
@@ -644,16 +772,23 @@ class EchoApp(App[None]):
         self._debug_note(
             "startup "
             f"mode={mode} live={self.live_audio} stable={self.live_rewrite_stable_seconds:.1f}s "
-            f"overlap={self.live_chunk_overlap_seconds:.2f}s "
-            f"insight[min_segments={self.insight_min_segments},pause={self.insight_pause_seconds:.1f}s]",
+            f"overlap={self.live_chunk_overlap_seconds:.2f}s seg_pause={self.live_segment_pause_seconds:.1f}s "
+            f"ui[max_sec={self.ui_segment_max_seconds:.1f},max_chars={self.ui_segment_max_chars},"
+            f"semantic_min={self.ui_segment_semantic_min_chars}] "
+            f"insight[min_chars={self.insight_min_chars},min_seconds={self.insight_live_min_seconds:.1f}s,"
+            f"pause={self.insight_pause_seconds:.1f}s,pause_min={self.insight_pause_min_chars},"
+            f"seg_min={self.insight_finalized_segment_min_chars},skip_min={self.insight_skip_min_chars},"
+            f"min_interval={self.insight_live_min_interval:.1f}s]",
         )
+        if self._debug_log_path is not None:
+            self._debug_note(f"debug log file: {self._debug_log_path}")
         # Keep exclusive=False so the insight loop does not cancel transcription.
         self.run_worker(self._transcription_worker(), exclusive=False)
         self.run_worker(self._insight_worker(), exclusive=False)
 
     def _tick_header(self) -> None:
         if self.live_audio:
-            state = "Paused" if self._paused else "Listening"
+            state = "Paused" if self._paused else "Recording"
         elif self.audio_path is not None:
             state = "Paused" if self._paused else "Transcribing"
         else:
@@ -665,7 +800,7 @@ class EchoApp(App[None]):
         else:
             mode = "Text"
         off = " · no LLM" if self._llm_offline else ""
-        self.sub_title = f"🎙 {mode} · {state}{off}  [{self._elapsed_hms()}]  p/s/c/q"
+        self.sub_title = f"🎙 {mode} · {state}{off}  [{self._elapsed_hms()}]  p/s/c/r/q"
 
     def _input_meter_text(self, *, chart_cols: int | None = None) -> str:
         if not self.live_audio:
@@ -684,12 +819,12 @@ class EchoApp(App[None]):
         if self._paused:
             state = "Paused"
         elif age > 2.0:
-            state = "No recent signal"
+            state = "Recording · no recent signal"
         else:
-            state = self._live_meter_note or "Listening"
+            state = f"Recording · {self._live_meter_note or 'Listening'}"
 
-        rms_bar = _meter_bar(rms_unit)
-        peak_bar = _meter_bar(peak_unit)
+        rms_bar = _meter_bar_markup(rms_unit)
+        peak_bar = _meter_bar_markup(peak_unit)
         # Use mostly peak dynamics; blend in RMS for smoother columns.
         blend = [
             max(0.0, min(1.0, (p * 0.75) + (r * 0.25)))
@@ -704,8 +839,8 @@ class EchoApp(App[None]):
         chart_block = "\n".join(chart)
         return (
             f"Input level · {state}\n"
-            f"RMS  [{rms_bar}] {_fmt_db(rms_db)} dBFS\n"
-            f"Peak [{peak_bar}] {_fmt_db(peak_db)} dBFS\n"
+            f"RMS  {rms_bar} {_fmt_db(rms_db)} dBFS\n"
+            f"Peak {peak_bar} {_fmt_db(peak_db)} dBFS\n"
             f"{chart_block}"
         )
 
@@ -748,6 +883,12 @@ class EchoApp(App[None]):
         self._debug_events.append(line)
         if len(self._debug_events) > self.debug_event_limit:
             self._debug_events = self._debug_events[-self.debug_event_limit :]
+        if self._debug_log_path is not None:
+            try:
+                with self._debug_log_path.open("a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception:
+                pass
 
     def _debug_panel_text(self) -> str:
         if not self._debug_events:
@@ -780,6 +921,40 @@ class EchoApp(App[None]):
                 "[dim]LLM unavailable: Insights and chat are disabled. Transcript still works.[/]"
             )
 
+    def action_reset(self) -> None:
+        self._paused = False
+        self._lines.clear()
+        self._line_ids.clear()
+        self._line_id_to_index.clear()
+        self._line_id_to_spoken.clear()
+        self._line_id_to_flushed.clear()
+        self._next_line_id = 1
+        self._transcript_log_prefix.clear()
+        self._insight_buffer.clear()
+        self._insight_passes.clear()
+        self._last_insight_at = time.monotonic()
+        self._last_transcript_activity_at = self._last_insight_at
+        self._force_live_insight_flush = False
+        self._live_preview_text = ""
+        self._live_meter_rms = 0.0
+        self._live_meter_peak = 0.0
+        self._live_meter_last_signal_at = 0.0
+        self._live_rms_hist = [0.0] * self.live_meter_history_width
+        self._live_peak_hist = [0.0] * self.live_meter_history_width
+        self._last_live_emitted_spoken = ""
+        self._live_meter_note = "Listening..." if self.live_audio else "Available in --live mode."
+
+        self.query_one("#transcript", RichLog).clear()
+        self.action_clear_chat()
+        self._debug_events.clear()
+        self._debug_note("session reset")
+
+        self._tick_live_preview()
+        self._tick_input_meter()
+        self._tick_debug_panel()
+        asyncio.create_task(self._refresh_insights_panel(tail=None))
+        self.notify("Session reset", timeout=2)
+
     def action_focus_insights(self) -> None:
         self.query_one("#insights", VerticalScroll).focus()
 
@@ -796,8 +971,13 @@ class EchoApp(App[None]):
         log.clear()
         for m in self._transcript_log_prefix:
             log.write(m)
-        for line in self._lines:
-            log.write(line)
+        for line_id, line in zip(self._line_ids, self._lines, strict=True):
+            log.write(self._render_transcript_line(line_id, line))
+
+    def _render_transcript_line(self, line_id: int, line: str) -> str:
+        if self._line_id_to_flushed.get(line_id, False):
+            return f"[white]{line}[/]"
+        return f"[dim]{line}[/]"
 
     async def _emit_transcript_line(
         self,
@@ -807,6 +987,8 @@ class EchoApp(App[None]):
         spoken_text: str | None = None,
         allow_correction: bool = True,
         stable_delay: float = 0.0,
+        enqueue: bool = True,
+        finalized: bool = True,
     ) -> TranscriptSegment:
         spoken = _normalize_spaces(spoken_text or _strip_leading_ts(line))
         seg = TranscriptSegment(
@@ -815,13 +997,17 @@ class EchoApp(App[None]):
             spoken_text=spoken,
             stable_after=time.monotonic() + max(0.0, stable_delay),
             allow_correction=allow_correction,
+            finalized=finalized,
         )
         self._next_line_id += 1
         self._line_id_to_index[seg.line_id] = len(self._lines)
         self._line_id_to_spoken[seg.line_id] = seg.spoken_text
+        self._line_id_to_flushed[seg.line_id] = False
+        self._line_ids.append(seg.line_id)
         self._lines.append(line)
-        log.write(line)
-        await self._transcript_queue.put(seg)
+        log.write(self._render_transcript_line(seg.line_id, line))
+        if enqueue:
+            await self._transcript_queue.put(seg)
         if self.live_audio:
             self._debug_note(
                 f"emit segment id={seg.line_id} stable={max(seg.stable_after - time.monotonic(), 0.0):.1f}s allow_fix={seg.allow_correction}",
@@ -837,13 +1023,18 @@ class EchoApp(App[None]):
         text: str,
         allow_correction: bool,
         pretyped: bool = False,
+        split_groups: bool = True,
     ) -> None:
         from echo.asr import format_timestamp_hms
 
         payload = _normalize_spaces(text)
         if not payload:
             return
-        groups = _split_live_groups(payload, max_chars=self.live_group_chars)
+        groups = (
+            _split_live_groups(payload, max_chars=self.live_group_chars)
+            if split_groups
+            else [payload]
+        )
         if not groups:
             return
 
@@ -1034,25 +1225,29 @@ class EchoApp(App[None]):
                 "[dim]Live: microphone + system output via authorized macOS capture command "
                 "(System Audio Recording Only on macOS 14.2+, otherwise Screen Recording; "
                 "Microphone permission may also be requested). "
-                f"Transcript flushes on stop words/punctuation or every ~{self.live_emit_interval:.0f}s.[/]",
+                "Transcript appends continuously and creates a new segment only after a long pause "
+                "(live preview stays realtime).[/]",
             )
         elif self.live_system_device is None:
             self._log_transcript_meta(
                 log,
                 "[dim]Live: microphone only. Add --live-system-device (e.g. BlackHole 2ch index) "
                 "to mix system audio, or create an aggregate input in Audio MIDI Setup. "
-                f"Transcript flushes on stop words/punctuation or every ~{self.live_emit_interval:.0f}s.[/]",
+                "Transcript appends continuously and creates a new segment only after a long pause "
+                "(live preview stays realtime).[/]",
             )
         else:
             self._log_transcript_meta(
                 log,
                 "[dim]Live: microphone + second input (50/50 mono mix). "
                 "p = pause (discards audio while paused). "
-                f"Transcript flushes on stop words/punctuation or every ~{self.live_emit_interval:.0f}s.[/]",
+                "Transcript appends continuously and creates a new segment only after a long pause "
+                "(live preview stays realtime).[/]",
             )
 
+        system_cap: LiveSystemAuthorizedCapture | None = None
         if self.live_system_authorized:
-            cap = LiveSystemAuthorizedCapture(
+            system_cap = LiveSystemAuthorizedCapture(
                 LiveSystemAuthorizedConfig(
                     mic_device=self.live_mic_device,
                     command=cmd,
@@ -1060,6 +1255,7 @@ class EchoApp(App[None]):
                     blocksize=2048,
                 )
             )
+            cap = system_cap
             try:
                 cap.start()
             except Exception as e:  # noqa: BLE001
@@ -1096,57 +1292,286 @@ class EchoApp(App[None]):
         pending_t1w: float | None = None
         pending_allow_correction = True
         pending_pretyped = False
+        last_voiced_wall = 0.0
+        live_draft_segment: TranscriptSegment | None = None
+        live_draft_t0w: float | None = None
+        live_draft_allow_correction = True
+        live_draft_stable_after = 0.0
+        live_draft_last_snapshot_text = ""
+        live_draft_last_snapshot_at = 0.0
 
-        async def _flush_pending() -> None:
+        def _clear_pending() -> None:
             nonlocal pending_texts, pending_t0w, pending_t1w, pending_allow_correction, pending_pretyped
-            if not pending_texts or pending_t0w is None or pending_t1w is None:
-                return
-            await self._flush_live_group(
-                log,
-                t0w=pending_t0w,
-                t1w=pending_t1w,
-                text=" ".join(pending_texts),
-                allow_correction=pending_allow_correction,
-                pretyped=pending_pretyped,
-            )
-            self._debug_note(
-                f"flush local lines={len(pending_texts)} allow_fix={pending_allow_correction}",
-            )
             pending_texts = []
             pending_t0w = None
             pending_t1w = None
             pending_allow_correction = True
             pending_pretyped = False
 
+        async def _append_live_draft(
+            *,
+            t0w: float,
+            t1w: float,
+            text: str,
+            allow_correction: bool,
+        ) -> None:
+            nonlocal live_draft_segment, live_draft_t0w, live_draft_allow_correction, live_draft_stable_after
+            nonlocal live_draft_last_snapshot_text, live_draft_last_snapshot_at
+            payload = _normalize_spaces(text)
+            if not payload:
+                return
+            if live_draft_segment is None or live_draft_t0w is None:
+                line = f"[{format_timestamp_hms(t0w)}–{format_timestamp_hms(t1w)}] {payload}"
+                live_draft_segment = await self._emit_transcript_line(
+                    log,
+                    line,
+                    spoken_text=payload,
+                    allow_correction=allow_correction,
+                    stable_delay=self.live_rewrite_stable_seconds if self.live_audio else 0.0,
+                    enqueue=False,
+                    finalized=False,
+                )
+                live_draft_t0w = t0w
+                live_draft_allow_correction = allow_correction
+                live_draft_stable_after = live_draft_segment.stable_after
+                live_draft_last_snapshot_text = payload
+                live_draft_last_snapshot_at = time.monotonic()
+                await self._transcript_queue.put(
+                    TranscriptSegment(
+                        line_id=live_draft_segment.line_id,
+                        line=line,
+                        spoken_text=payload,
+                        stable_after=live_draft_stable_after,
+                        allow_correction=allow_correction,
+                        finalized=False,
+                    )
+                )
+                return
+
+            seg_id = live_draft_segment.line_id
+            idx = self._line_id_to_index.get(seg_id)
+            if idx is None or idx < 0 or idx >= len(self._lines):
+                # Fallback: if a draft line was externally reset, start a new draft line.
+                line = f"[{format_timestamp_hms(t0w)}–{format_timestamp_hms(t1w)}] {payload}"
+                live_draft_segment = await self._emit_transcript_line(
+                    log,
+                    line,
+                    spoken_text=payload,
+                    allow_correction=allow_correction,
+                    stable_delay=self.live_rewrite_stable_seconds if self.live_audio else 0.0,
+                    enqueue=False,
+                    finalized=False,
+                )
+                live_draft_t0w = t0w
+                live_draft_allow_correction = allow_correction
+                live_draft_stable_after = live_draft_segment.stable_after
+                live_draft_last_snapshot_text = payload
+                live_draft_last_snapshot_at = time.monotonic()
+                await self._transcript_queue.put(
+                    TranscriptSegment(
+                        line_id=live_draft_segment.line_id,
+                        line=line,
+                        spoken_text=payload,
+                        stable_after=live_draft_stable_after,
+                        allow_correction=allow_correction,
+                        finalized=False,
+                    )
+                )
+                return
+
+            prev_spoken = self._line_id_to_spoken.get(seg_id, live_draft_segment.spoken_text)
+            merged = _normalize_spaces(f"{prev_spoken} {payload}")
+            line = f"[{format_timestamp_hms(live_draft_t0w)}–{format_timestamp_hms(t1w)}] {merged}"
+            self._lines[idx] = line
+            self._line_id_to_spoken[seg_id] = merged
+            live_draft_allow_correction = live_draft_allow_correction and allow_correction
+            live_draft_segment.line = line
+            live_draft_segment.spoken_text = merged
+            live_draft_segment.allow_correction = live_draft_allow_correction
+            live_draft_segment.stable_after = live_draft_stable_after
+            live_draft_segment.finalized = False
+            await self._refresh_transcript_log()
+            now = time.monotonic()
+            should_snapshot = (
+                merged != live_draft_last_snapshot_text
+                and (now - live_draft_last_snapshot_at) >= self.insight_pause_seconds
+            )
+            if should_snapshot:
+                live_draft_last_snapshot_text = merged
+                live_draft_last_snapshot_at = now
+                await self._transcript_queue.put(
+                    TranscriptSegment(
+                        line_id=live_draft_segment.line_id,
+                        line=line,
+                        spoken_text=merged,
+                        stable_after=live_draft_stable_after,
+                        allow_correction=live_draft_allow_correction,
+                        finalized=False,
+                    )
+                )
+
+        async def _finalize_live_draft(reason: str) -> bool:
+            nonlocal live_draft_segment, live_draft_t0w, live_draft_allow_correction, live_draft_stable_after
+            nonlocal live_draft_last_snapshot_text, live_draft_last_snapshot_at
+            if live_draft_segment is None:
+                return False
+            spoken = self._line_id_to_spoken.get(live_draft_segment.line_id, live_draft_segment.spoken_text).strip()
+            if not spoken:
+                live_draft_segment = None
+                live_draft_t0w = None
+                live_draft_allow_correction = True
+                live_draft_stable_after = 0.0
+                return False
+            if spoken == self._last_live_emitted_spoken:
+                self._debug_note("pause flush dropped identical segment")
+                live_draft_segment = None
+                live_draft_t0w = None
+                live_draft_allow_correction = True
+                live_draft_stable_after = 0.0
+                live_draft_last_snapshot_text = ""
+                live_draft_last_snapshot_at = 0.0
+                return False
+            live_draft_segment.spoken_text = spoken
+            live_draft_segment.allow_correction = live_draft_allow_correction
+            live_draft_segment.stable_after = live_draft_stable_after
+            live_draft_segment.finalized = True
+            await self._transcript_queue.put(live_draft_segment)
+            self._last_live_emitted_spoken = spoken
+            self._debug_note(
+                f"flush local reason={reason} chars={len(spoken)} allow_fix={live_draft_allow_correction}",
+            )
+            live_draft_segment = None
+            live_draft_t0w = None
+            live_draft_allow_correction = True
+            live_draft_stable_after = 0.0
+            live_draft_last_snapshot_text = ""
+            live_draft_last_snapshot_at = 0.0
+            return True
+
+        def _draft_finalize_reason(*, reason: str, idle_for: float) -> str:
+            if live_draft_segment is None:
+                return ""
+            spoken = self._line_id_to_spoken.get(live_draft_segment.line_id, live_draft_segment.spoken_text).strip()
+            if not spoken:
+                return ""
+            if reason in ("pause", "paused", "capture_stopped", "stop"):
+                return reason
+            if len(spoken) >= self.ui_segment_max_chars:
+                return "max_chars"
+            span = _line_span_seconds(live_draft_segment.line)
+            if span is not None:
+                t0, t1 = span
+                if max(0.0, t1 - t0) >= self.ui_segment_max_seconds:
+                    return "max_seconds"
+            if (
+                _LIVE_SENTENCE_END_RE.search(spoken)
+                and len(spoken) >= self.ui_segment_semantic_min_chars
+            ):
+                return "sentence_end"
+            if idle_for >= self.live_segment_pause_seconds:
+                return "pause"
+            return ""
+
+        async def _flush_pending(reason: str) -> None:
+            if not pending_texts or pending_t0w is None or pending_t1w is None:
+                idle_for = (time.monotonic() - last_voiced_wall) if last_voiced_wall > 0 else 0.0
+                fin_reason = _draft_finalize_reason(reason=reason, idle_for=idle_for)
+                if fin_reason:
+                    emitted = await _finalize_live_draft(fin_reason)
+                    if emitted and fin_reason in ("stop", "capture_stopped"):
+                        self._force_live_insight_flush = True
+                return
+            joined = _normalize_spaces(" ".join(pending_texts))
+            if not joined:
+                _clear_pending()
+                return
+            if self.live_emit_interval <= 0.0:
+                await _append_live_draft(
+                    t0w=pending_t0w,
+                    t1w=pending_t1w,
+                    text=joined,
+                    allow_correction=pending_allow_correction,
+                )
+                _clear_pending()
+                idle_for = (time.monotonic() - last_voiced_wall) if last_voiced_wall > 0 else 0.0
+                fin_reason = _draft_finalize_reason(reason=reason, idle_for=idle_for)
+                if fin_reason:
+                    emitted = await _finalize_live_draft(fin_reason)
+                    if emitted and fin_reason in ("stop", "capture_stopped"):
+                        self._force_live_insight_flush = True
+                return
+            if joined == self._last_live_emitted_spoken:
+                self._debug_note("pause flush dropped identical segment")
+            else:
+                await self._flush_live_group(
+                    log,
+                    t0w=pending_t0w,
+                    t1w=pending_t1w,
+                    text=joined,
+                    allow_correction=pending_allow_correction,
+                    pretyped=pending_pretyped,
+                    split_groups=False,
+                )
+                self._last_live_emitted_spoken = joined
+                self._debug_note(
+                    f"flush local reason={reason} chars={len(joined)} allow_fix={pending_allow_correction}",
+                )
+            _clear_pending()
+
+        async def _flush_if_needed(*, idle_tick: bool) -> None:
+            nonlocal pending_t0w, pending_t1w
+            idle_for = (time.monotonic() - last_voiced_wall) if last_voiced_wall > 0 else 0.0
+            if not pending_texts:
+                if (
+                    idle_tick
+                    and self.live_emit_interval <= 0.0
+                    and live_draft_segment is not None
+                    and idle_for >= self.live_segment_pause_seconds
+                ):
+                    await _flush_pending("pause")
+                return
+            pending_duration = 0.0
+            if pending_t0w is not None and pending_t1w is not None:
+                pending_duration = max(0.0, pending_t1w - pending_t0w)
+            should_flush, reason = _should_flush_live_pending(
+                has_pending=bool(pending_texts),
+                pending_duration=pending_duration,
+                idle_tick=idle_tick,
+                idle_for=idle_for,
+                pause_seconds=self.live_segment_pause_seconds,
+                emit_interval=self.live_emit_interval,
+            )
+            if should_flush:
+                await _flush_pending(reason)
+
         try:
             while True:
                 while self._paused:
-                    await _flush_pending()
+                    await _flush_pending("paused")
                     await asyncio.to_thread(cap.read_block, 0.2)
                     await asyncio.sleep(0.05)
 
                 block = await asyncio.to_thread(cap.read_block, 0.35)
                 if block is None:
-                    if self.live_system_authorized and hasattr(cap, "process_exited"):
-                        if cap.process_exited():
-                            msg = ""
-                            if hasattr(cap, "process_error_text"):
-                                msg = cap.process_error_text()
-                            await _flush_pending()
-                            self._log_transcript_meta(
-                                log,
-                                "[red]System-authorized capture stopped:[/] "
-                                f"{msg or 'unknown helper failure'}",
-                            )
-                            self._live_meter_note = "Capture stopped"
-                            self._debug_note(f"capture stopped: {msg or 'unknown helper failure'}")
-                            self._live_preview_text = ""
-                            self._tick_live_preview()
-                            return
+                    if system_cap is not None and system_cap.process_exited():
+                        msg = system_cap.process_error_text()
+                        await _flush_pending("capture_stopped")
+                        self._log_transcript_meta(
+                            log,
+                            "[red]System-authorized capture stopped:[/] "
+                            f"{msg or 'unknown helper failure'}",
+                        )
+                        self._live_meter_note = "Capture stopped"
+                        self._debug_note(f"capture stopped: {msg or 'unknown helper failure'}")
+                        self._live_preview_text = ""
+                        self._tick_live_preview()
+                        return
+                    await _flush_if_needed(idle_tick=True)
                     await asyncio.sleep(0.02)
                     continue
                 arr = np.asarray(block, dtype=np.float32).reshape(-1)
                 if arr.size == 0:
+                    await _flush_if_needed(idle_tick=True)
                     await asyncio.sleep(0.02)
                     continue
                 block_rms = float(np.sqrt(np.mean(np.square(arr), dtype=np.float64)))
@@ -1184,6 +1609,7 @@ class EchoApp(App[None]):
                                     f"gate silence rms={piece_rms:.4f} peak={piece_peak:.4f} active={piece_active_ratio:.3f}",
                                 )
                                 self._last_silence_debug_at = now_dbg
+                        await _flush_if_needed(idle_tick=True)
                         continue
                     try:
                         text = await asyncio.to_thread(
@@ -1203,12 +1629,19 @@ class EchoApp(App[None]):
                     cleaned = _normalize_spaces(text)
                     if not cleaned:
                         continue
-                    deduped = _trim_chunk_overlap(last_chunk_text, cleaned)
+                    deduped = _trim_chunk_overlap(
+                        last_chunk_text,
+                        cleaned,
+                        min_chars=self.live_overlap_min_chars,
+                    )
                     last_chunk_text = cleaned
                     if not deduped:
                         self._debug_note("dedup dropped fully-overlapped chunk")
                         continue
 
+                    allow_piece_correction = piece_rms >= (self.live_min_rms * 1.25) or (
+                        piece_active_ratio >= (self.live_min_active_ratio * 2.0)
+                    )
                     if pending_t0w is None:
                         pending_t0w = t0w
                     pending_t1w = t1w
@@ -1216,20 +1649,11 @@ class EchoApp(App[None]):
                     await self._typewriter_preview_append(preview_ts, deduped)
                     pending_pretyped = True
                     pending_texts.append(deduped)
-                    allow_piece_correction = piece_rms >= (self.live_min_rms * 1.25) or (
-                        piece_active_ratio >= (self.live_min_active_ratio * 2.0)
-                    )
                     pending_allow_correction = pending_allow_correction and allow_piece_correction
-
-                    window = (pending_t1w - pending_t0w) if pending_t0w is not None else 0.0
-                    hit_boundary = bool(_LIVE_SENTENCE_END_RE.search(deduped)) or _live_hits_stop_word(
-                        deduped,
-                        self.live_stop_words,
-                    )
-                    if hit_boundary or window >= self.live_emit_interval:
-                        await _flush_pending()
+                    last_voiced_wall = time.monotonic()
+                    await _flush_if_needed(idle_tick=False)
         finally:
-            await _flush_pending()
+            await _flush_pending("stop")
             self._live_meter_note = "Stopped"
             self._debug_note("live transcription stopped")
             self._live_preview_text = ""
@@ -1247,26 +1671,77 @@ class EchoApp(App[None]):
                 buf_text = "\n".join(seg.spoken_text for seg in source_segments).strip()
                 self._insight_buffer.clear()
                 if buf_text and not self._llm_offline:
-                    asyncio.create_task(self._run_insight_pass(buf_text, source_segments))
+                    await self._run_insight_pass(buf_text, source_segments)
                 break
             if isinstance(chunk, TranscriptSegment) and not self._llm_offline:
-                self._insight_buffer.append(chunk)
+                replaced = False
+                for i, seg in enumerate(self._insight_buffer):
+                    if seg.line_id == chunk.line_id:
+                        self._insight_buffer[i] = chunk
+                        replaced = True
+                        break
+                if not replaced:
+                    self._insight_buffer.append(chunk)
                 self._last_transcript_activity_at = time.monotonic()
             if self._paused:
                 # Pause means "freeze insight generation": keep buffering but do not trigger new passes.
                 continue
             now = time.monotonic()
-            eligible = [seg for seg in self._insight_buffer if seg.stable_after <= now]
+            if self.live_audio:
+                eligible = list(self._insight_buffer)
+            else:
+                eligible = [seg for seg in self._insight_buffer if seg.stable_after <= now]
             buf_text = "\n".join(seg.spoken_text for seg in eligible).strip()
+            span_start: float | None = None
+            span_end: float | None = None
+            for seg in eligible:
+                span = _line_span_seconds(seg.line)
+                if span is None:
+                    continue
+                t0, t1 = span
+                span_start = t0 if span_start is None else min(span_start, t0)
+                span_end = t1 if span_end is None else max(span_end, t1)
+            new_seconds = (
+                max(0.0, span_end - span_start)
+                if span_start is not None and span_end is not None
+                else 0.0
+            )
+            new_finalized_segments = sum(1 for seg in eligible if seg.finalized)
+            max_finalized_segment_chars = max(
+                (len(seg.spoken_text) for seg in eligible if seg.finalized),
+                default=0,
+            )
             trigger_reason = ""
             if self.live_audio:
                 should_run, trigger_reason = _should_trigger_insight_live(
-                    eligible_segments=len(eligible),
+                    new_chars=len(buf_text),
+                    new_seconds=new_seconds,
+                    new_finalized_segments=new_finalized_segments,
+                    max_finalized_segment_chars=max_finalized_segment_chars,
                     idle_tick=(chunk is None),
                     idle_for=now - self._last_transcript_activity_at,
-                    min_segments=self.insight_min_segments,
+                    min_chars=self.insight_min_chars,
+                    min_seconds=self.insight_live_min_seconds,
+                    pause_min_chars=self.insight_pause_min_chars,
+                    finalized_segment_min_chars=self.insight_finalized_segment_min_chars,
+                    skip_min_chars=self.insight_skip_min_chars,
                     pause_seconds=self.insight_pause_seconds,
                 )
+                if self._force_live_insight_flush and buf_text:
+                    should_run = True
+                    trigger_reason = "forced_final"
+                    self._force_live_insight_flush = False
+                elif should_run and (now - self._last_insight_at) < self.insight_live_min_interval:
+                    should_run = False
+                    trigger_reason = "min_interval"
+                    if now - self._last_min_interval_debug_at >= 1.0:
+                        wait_for = max(0.0, self.insight_live_min_interval - (now - self._last_insight_at))
+                        self._debug_note(
+                            "insight skipped "
+                            f"reason=min_interval wait={wait_for:.1f}s chars={len(buf_text)} "
+                            f"finalized={new_finalized_segments} duration={new_seconds:.1f}s",
+                        )
+                        self._last_min_interval_debug_at = now
             else:
                 should_run = bool(buf_text) and (
                     len(buf_text) >= self.insight_min_chars
@@ -1539,6 +2014,10 @@ class EchoApp(App[None]):
                             web_md=web_md,
                         ),
                     )
+                if source_segments:
+                    for seg in source_segments:
+                        self._line_id_to_flushed[seg.line_id] = True
+                    await self._refresh_transcript_log()
                 await self._refresh_insights_panel(tail=None)
             except Exception as e:  # noqa: BLE001
                 self.log.exception("insights panel failed")
@@ -1690,5 +2169,5 @@ def run_echo(
         live_system_device=live_system_device,
         live_system_authorized=live_system_authorized,
         live_system_authorized_cmd=live_system_authorized_cmd,
-        live_emit_interval=15.0 if live_audio else 5.0,
+        live_emit_interval=0.0 if live_audio else 5.0,
     ).run()

@@ -268,19 +268,16 @@ def transcribe_mono16k_chunk(
         pred_ids = model.generate(
             feats,
             forced_decoder_ids=forced_decoder_ids,
-            max_new_tokens=_whisper_max_new_tokens(model, forced_decoder_ids),
+            max_length=_whisper_max_length(model),
         )
     return processor.batch_decode(pred_ids, skip_special_tokens=True)[0].strip()
 
 
-def _whisper_max_new_tokens(model: object, forced_decoder_ids: list | None) -> int:
-    """Cap new tokens so decoder prompt + generation fits ``max_target_positions`` (Whisper = 448)."""
+def _whisper_max_length(model: object) -> int:
+    """Decoder length cap for Whisper generation (typically ``max_target_positions`` = 448)."""
     cfg = getattr(model, "config", None)
     cap = int(getattr(cfg, "max_target_positions", None) or getattr(cfg, "max_length", None) or 448)
-    n_forced = len(forced_decoder_ids or [])
-    # Initial decoder rows include forced prompt tokens plus start/special slots (empirically ~4 for JP transcribe).
-    decoder_prompt_slots = max(4, n_forced + 1)
-    return max(32, cap - decoder_prompt_slots)
+    return max(32, cap)
 
 
 class TranscribeSession:

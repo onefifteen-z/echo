@@ -17,7 +17,7 @@ AGENT_MD_MARKER = "## Echo runtime digest (injected into LLM prompts)"
 # Used when AGENT.md is missing or has no digest section.
 _AGENT_DIGEST_FALLBACK = """**Transcript / ASR:** Treat input as noisy STT; return `corrected_transcript` with same meaning, fixing probable errors; never invent facts or new lines.
 
-**Comment (live meeting, scan in seconds):** Hard cap **~90 words** in `comment` (same language as transcript). Format: **one** headline sentence (So what?) + **at most 2** very short bullets (facts from chunk only) + **one** closing line (Now what / decision / one question). No section headers unless essential.
+**Comment (live meeting, scan in seconds):** Hard cap **~90 words** in `comment` (same language as transcript). Format: **one** headline conclusion sentence (So what) + **at most 2** very short bullets (facts from chunk only) + **one** closing line (Now what / decision). Use declarative statements only; do not ask questions and avoid `?`. No section headers unless essential.
 
 **Web search:** `comment` empty; sharp `search_query`; still return `corrected_transcript`."""
 
@@ -170,7 +170,7 @@ Return ONLY valid JSON (no markdown code fences) with exactly these keys:
 - "action": either "comment" or "web_search"
 - "corrected_transcript": string — same content as the raw chunk with probable ASR/typo/word-boundary fixes; **same language**; **do not** add facts, numbers, or lines not clearly grounded in the chunk. If nothing needs fixing, return the raw chunk verbatim.
 - "corrected_segments": array of objects with shape {"id": number, "text": string}. Use ONLY ids listed below. Keep line boundaries: do not merge or split segments. "text" must be content-only (no timestamps). If no segment-level edits, return [].
-- "comment": string (markdown). If action is "comment": **very short** live-meeting insight per digest: **one** lead sentence (So what?) + **at most 2** bullets + **one** closing line (Now what?); **hard cap ~90 words** total—people are in a meeting. If action is "web_search": empty string "".
+- "comment": string (markdown). If action is "comment": **very short** live-meeting insight per digest: **one** lead conclusion sentence (So what) + **at most 2** bullets + **one** closing decision line (Now what); **hard cap ~90 words** total—people are in a meeting; declarative only (no questions, avoid `?`). If action is "web_search": empty string "".
 - "search_query": string. If action is "web_search": concise keywords for a web search. If action is "comment": empty string "".
 - "reason": one short line explaining the routing choice.
 

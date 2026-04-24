@@ -12,6 +12,46 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def _mix_mono_with_activity_gate(mic: object, sys: object, *, silence_floor: float = 1e-4) -> object:
+    """Blend mic/system audio without attenuating an active side by silent input.
+
+    When one side is effectively silent, pass through the active side directly.
+    Otherwise keep the existing 50/50 mix.
+    """
+    import numpy as np
+
+    m = np.asarray(mic, dtype=np.float32).reshape(-1)
+    s = np.asarray(sys, dtype=np.float32).reshape(-1)
+    n = min(m.shape[0], s.shape[0])
+    if n <= 0:
+        return np.zeros((0,), dtype=np.float32)
+    m2 = m[:n]
+    s2 = s[:n]
+    m_rms = float(np.sqrt(np.mean(np.square(m2), dtype=np.float64)))
+    s_rms = float(np.sqrt(np.mean(np.square(s2), dtype=np.float64)))
+    if m_rms <= silence_floor and s_rms > silence_floor:
+        return np.clip(s2, -1.0, 1.0)
+    if s_rms <= silence_floor and m_rms > silence_floor:
+        return np.clip(m2, -1.0, 1.0)
+    mix = 0.5 * (m2 + s2)
+    return np.clip(mix, -1.0, 1.0)
+
+
+def _safe_queue_put(q: queue.Queue, item: object) -> None:
+    """Put without blocking; drop oldest item when full."""
+    try:
+        q.put_nowait(item)
+    except queue.Full:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            q.put_nowait(item)
+        except queue.Full:
+            pass
+
+
 def _require_sounddevice() -> None:
     try:
         import sounddevice  # noqa: F401
@@ -36,9 +76,8 @@ def _system_audio_helper_binary_path() -> Path:
 def ensure_macos_system_audio_helper() -> str:
     """Build bundled system-audio helper and return executable path.
 
-    The helper prefers the macOS 14.2+ Core Audio process-tap path
-    (only triggers the "System Audio Recording Only" privacy prompt) and
-    falls back to ScreenCaptureKit when that is unavailable.
+    The helper uses ScreenCaptureKit by default and can opt into the
+    macOS 14.2+ Core Audio process-tap path via ``ECHO_ENABLE_AUDIO_TAP=1``.
     """
     if sys.platform != "darwin":
         raise RuntimeError("System-authorized live capture is available on macOS only.")
@@ -160,19 +199,6 @@ class LivePairedCapture:
         self._mix_thread: threading.Thread | None = None
         self._streams: list[object] = []
 
-    def _safe_put(self, q: queue.Queue, item: object) -> None:
-        try:
-            q.put_nowait(item)
-        except queue.Full:
-            try:
-                q.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                q.put_nowait(item)
-            except queue.Full:
-                pass
-
     def start(self) -> None:
         import numpy as np
 
@@ -184,9 +210,9 @@ class LivePairedCapture:
                 return
             chunk = np.clip(indata.copy().reshape(-1), -1.0, 1.0)
             if self.cfg.system_device is None:
-                self._safe_put(self.out_q, chunk)
+                _safe_queue_put(self.out_q, chunk)
             else:
-                self._safe_put(self._mic_q, chunk)
+                _safe_queue_put(self._mic_q, chunk)
 
         mic_stream = sd.InputStream(
             device=self.cfg.mic_device,
@@ -205,7 +231,7 @@ class LivePairedCapture:
                 if self._stop.is_set():
                     return
                 chunk = np.clip(indata.copy().reshape(-1), -1.0, 1.0)
-                self._safe_put(self._sys_q, chunk)
+                _safe_queue_put(self._sys_q, chunk)
 
             sys_stream = sd.InputStream(
                 device=self.cfg.system_device,
@@ -227,13 +253,12 @@ class LivePairedCapture:
                     try:
                         s = self._sys_q.get(timeout=0.2)
                     except queue.Empty:
-                        self._safe_put(self.out_q, m)
+                        _safe_queue_put(self.out_q, m)
                         continue
-                    n = min(m.shape[0], s.shape[0])
-                    if n <= 0:
+                    mix = _mix_mono_with_activity_gate(m, s)
+                    if mix.shape[0] <= 0:
                         continue
-                    mix = 0.5 * (m[:n] + s[:n])
-                    self._safe_put(self.out_q, np.clip(mix, -1.0, 1.0))
+                    _safe_queue_put(self.out_q, mix)
 
             self._mix_thread = threading.Thread(target=mix_loop, name="echo-live-mix", daemon=True)
             self._mix_thread.start()
@@ -293,19 +318,6 @@ class LiveSystemAuthorizedCapture:
         self._proc: subprocess.Popen[bytes] | None = None
         self.last_stderr_line: str = ""
 
-    def _safe_put(self, q: queue.Queue, item: object) -> None:
-        try:
-            q.put_nowait(item)
-        except queue.Full:
-            try:
-                q.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                q.put_nowait(item)
-            except queue.Full:
-                pass
-
     def start(self) -> None:
         import numpy as np
 
@@ -335,7 +347,7 @@ class LiveSystemAuthorizedCapture:
             if self._stop.is_set():
                 return
             chunk = np.clip(indata.copy().reshape(-1), -1.0, 1.0)
-            self._safe_put(self._mic_q, chunk)
+            _safe_queue_put(self._mic_q, chunk)
 
         mic_stream = sd.InputStream(
             device=self.cfg.mic_device,
@@ -373,7 +385,7 @@ class LiveSystemAuthorizedCapture:
                 while out_buf.size >= self.cfg.blocksize:
                     blk = out_buf[: self.cfg.blocksize]
                     out_buf = out_buf[self.cfg.blocksize :]
-                    self._safe_put(self._sys_q, np.clip(blk, -1.0, 1.0))
+                    _safe_queue_put(self._sys_q, np.clip(blk, -1.0, 1.0))
 
         def sys_err_loop() -> None:
             assert self._proc is not None and self._proc.stderr is not None
@@ -392,13 +404,12 @@ class LiveSystemAuthorizedCapture:
                 try:
                     s = self._sys_q.get(timeout=0.2)
                 except queue.Empty:
-                    self._safe_put(self.out_q, m)
+                    _safe_queue_put(self.out_q, m)
                     continue
-                n = min(m.shape[0], s.shape[0])
-                if n <= 0:
+                mix = _mix_mono_with_activity_gate(m, s)
+                if mix.shape[0] <= 0:
                     continue
-                mix = 0.5 * (m[:n] + s[:n])
-                self._safe_put(self.out_q, np.clip(mix, -1.0, 1.0))
+                _safe_queue_put(self.out_q, mix)
 
         self._sys_read_thread = threading.Thread(target=sys_read_loop, name="echo-live-sys-read", daemon=True)
         self._sys_err_thread = threading.Thread(target=sys_err_loop, name="echo-live-sys-err", daemon=True)

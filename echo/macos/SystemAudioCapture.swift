@@ -368,17 +368,17 @@ final class AudioDumper: NSObject, SCStreamDelegate, SCStreamOutput {
     }
 }
 
-// MARK: - Top-level: prefer audio-only tap, fall back to ScreenCaptureKit.
+// MARK: - Top-level: use ScreenCaptureKit by default.
 
-func envAllowsTap() -> Bool {
-    let raw = (ProcessInfo.processInfo.environment["ECHO_DISABLE_AUDIO_TAP"] ?? "").lowercased()
-    return !["1", "true", "yes", "on"].contains(raw)
+func envEnablesTap() -> Bool {
+    let raw = (ProcessInfo.processInfo.environment["ECHO_ENABLE_AUDIO_TAP"] ?? "").lowercased()
+    return ["1", "true", "yes", "on"].contains(raw)
 }
 
 var retainedTapSession: AnyObject?
 
 Task {
-    if #available(macOS 14.2, *), envAllowsTap() {
+    if #available(macOS 14.2, *), envEnablesTap() {
         let session = AudioOnlyTapSession()
         do {
             try session.start()
@@ -386,8 +386,8 @@ Task {
             // Capture continues on Core Audio's IO thread; just keep the process alive.
             return
         } catch {
-            fputs("echo-system-audio-capture: audio-only tap unavailable (\(error)); "
-                  + "falling back to ScreenCaptureKit (Screen Recording permission needed)\n", stderr)
+            fputs("echo-system-audio-capture: audio-only tap failed (\(error)); "
+                  + "falling back to ScreenCaptureKit\n", stderr)
         }
     }
     do {

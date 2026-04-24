@@ -118,9 +118,10 @@ Reduce ambiguity, improve decision quality, increase execution feasibility, conn
 **When `action` is `comment` — McKinsey-style *Key insight* (meeting scan: seconds)**
 
 - **Hard cap ~90 words** in the `comment` field (same language as transcript). People are in a live meeting.
-- **Lead** with **one** sharp sentence (**So what?**).
+- **Lead** with **one** sharp conclusion sentence (**So what**).
 - **Then at most 2** ultra-short bullets (chunk-grounded facts only); skip bullets if one sentence suffices.
-- **Close** with **one** line (**Now what?**): next step, decision, or a single clarifying question.
+- **Close** with **one** line (**Now what**): a concrete next step or decision.
+- Use declarative wording; **do not** ask questions in `comment` (avoid `?`).
 - No section headers, no frameworks spelt out; avoid buzzwords and preamble.
 
 **When `action` is `web_search`**
