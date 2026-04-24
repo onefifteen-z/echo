@@ -90,7 +90,7 @@ def main() -> None:
         "--chunk-seconds",
         type=float,
         default=None,
-        help="ASR window in seconds (default: 2 with --live, 30 with --audio).",
+        help="ASR window in seconds (default: 5 with --live, 30 with --audio).",
     )
     p.add_argument(
         "--whisper-device",
@@ -117,7 +117,7 @@ def main() -> None:
 
     chunk_seconds = args.chunk_seconds
     if chunk_seconds is None:
-        chunk_seconds = 2.0 if args.live else 30.0
+        chunk_seconds = 5.0 if args.live else 30.0
 
     live_mic: int | None = None
     live_sys: int | None = None

@@ -20,6 +20,73 @@ def test_live_stop_word_detection_handles_trailing_punctuation() -> None:
     assert not _live_hits_stop_word("Still discussing open tasks", ("done",))
 
 
+def test_live_noise_token_detection_handles_punctuation_and_case() -> None:
+    from echo.app import _is_live_noise_token
+
+    assert _is_live_noise_token("ごめん。", noise_tokens=("ごめん",), max_chars=4)
+    assert _is_live_noise_token("GOMEN?", noise_tokens=("gomen",), max_chars=5)
+    assert not _is_live_noise_token("ごめん です", noise_tokens=("ごめん",), max_chars=4)
+
+
+def test_should_drop_live_noise_token_on_segment_start_even_with_louder_audio() -> None:
+    from echo.app import _should_drop_live_noise_token
+
+    assert _should_drop_live_noise_token(
+        text="ごめん",
+        noise_tokens=("ごめん",),
+        always_drop_tokens=(),
+        max_chars=4,
+        piece_rms=0.02,
+        min_rms=0.0035,
+        max_rms_factor=1.3,
+        is_segment_start=True,
+        drop_at_segment_start=True,
+    )
+
+
+def test_should_drop_live_noise_token_by_rms_when_not_segment_start() -> None:
+    from echo.app import _should_drop_live_noise_token
+
+    assert _should_drop_live_noise_token(
+        text="ごめん",
+        noise_tokens=("ごめん",),
+        always_drop_tokens=(),
+        max_chars=4,
+        piece_rms=0.003,
+        min_rms=0.0035,
+        max_rms_factor=1.3,
+        is_segment_start=False,
+        drop_at_segment_start=True,
+    )
+    assert not _should_drop_live_noise_token(
+        text="ごめん",
+        noise_tokens=("ごめん",),
+        always_drop_tokens=(),
+        max_chars=4,
+        piece_rms=0.02,
+        min_rms=0.0035,
+        max_rms_factor=1.3,
+        is_segment_start=False,
+        drop_at_segment_start=True,
+    )
+
+
+def test_should_drop_live_noise_token_always_drop_list_ignores_rms_and_position() -> None:
+    from echo.app import _should_drop_live_noise_token
+
+    assert _should_drop_live_noise_token(
+        text="ごめん",
+        noise_tokens=("ごめん",),
+        always_drop_tokens=("ごめん",),
+        max_chars=4,
+        piece_rms=0.2,
+        min_rms=0.0035,
+        max_rms_factor=1.3,
+        is_segment_start=False,
+        drop_at_segment_start=False,
+    )
+
+
 def test_trim_chunk_overlap_removes_prefix_duplication() -> None:
     from echo.app import _trim_chunk_overlap
 
@@ -96,6 +163,48 @@ def test_should_trigger_insight_live_on_duration() -> None:
     )
     assert ok is True
     assert reason == "duration"
+
+
+def test_insight_segments_signature_distinguishes_finalized_state() -> None:
+    from echo.app import TranscriptSegment, _insight_segments_signature
+
+    seg_a = TranscriptSegment(
+        line_id=7,
+        line="[00:00:01–00:00:02] hello",
+        spoken_text="hello",
+        stable_after=0.0,
+        allow_correction=True,
+        finalized=False,
+    )
+    seg_b = TranscriptSegment(
+        line_id=7,
+        line="[00:00:01–00:00:02] hello",
+        spoken_text="hello",
+        stable_after=0.0,
+        allow_correction=True,
+        finalized=True,
+    )
+    assert _insight_segments_signature([seg_a]) != _insight_segments_signature([seg_b])
+
+
+def test_meaningful_new_content_since_comment_requires_delta_threshold() -> None:
+    from echo.app import _has_meaningful_new_content_since_comment
+
+    assert not _has_meaningful_new_content_since_comment(
+        current_text="status update",
+        previous_comment_input="status update",
+        min_delta_chars=50,
+    )
+    assert not _has_meaningful_new_content_since_comment(
+        current_text="status update plus tiny",
+        previous_comment_input="status update",
+        min_delta_chars=50,
+    )
+    assert _has_meaningful_new_content_since_comment(
+        current_text="status update " + ("x" * 80),
+        previous_comment_input="status update",
+        min_delta_chars=50,
+    )
 
 
 def test_should_trigger_insight_live_on_pause() -> None:

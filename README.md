@@ -78,6 +78,10 @@ echo-tui --live --live-mic-device 0 --live-system-device 2 --chunk-seconds 5
 # Live without BlackHole: use bundled ScreenCaptureKit helper + mic
 echo-tui --live --live-system-authorized
 
+# Simple live shortcuts (no long argument list)
+./bin/echo-live
+./bin/echo-live-debug
+
 # ASR options
 echo-tui --audio meeting.wav --chunk-seconds 30 --model-id kotoba-tech/kotoba-whisper-v2.2
 echo-tui --audio meeting.wav --whisper-device cuda   # or: cpu, mps
@@ -118,6 +122,12 @@ Loads the same `.env` rules as the app (repo root then cwd), prints which LLM ro
 | `ECHO_NO_SPLASH` | Set to `1` / `true` / `yes` to skip the green ASCII **ECHO** startup splash (e.g. for automation). |
 | `ECHO_WHISPER_LANGUAGE` | Whisper `language=` for forced decoder ids (default `japanese` for Kotoba). Set e.g. `english` for other models. |
 | `ECHO_LIVE_EMIT_INTERVAL` | Legacy batch mode knob for live transcript flushing. `0` (default) keeps Echo in append-draft mode and uses semantic/pause/length segmentation rules. Positive values switch to interval batching. |
+| `ECHO_LIVE_NOISE_TOKENS` | Comma-separated short tokens to suppress in live ASR when they look like low-energy noise hallucinations (default: `ごめん`). |
+| `ECHO_LIVE_ALWAYS_DROP_NOISE_TOKENS` | Comma-separated tokens to always suppress when matched (default: `ごめん`), regardless of RMS or segment position. |
+| `ECHO_LIVE_NOISE_MAX_CHARS` | Maximum normalized token length eligible for noise suppression (default `4`). |
+| `ECHO_LIVE_NOISE_MAX_RMS_FACTOR` | Relative RMS ceiling for noise-token suppression, scaled by `ECHO_LIVE_MIN_RMS` (default `1.3`). |
+| `ECHO_LIVE_NOISE_DROP_AT_SEGMENT_START` | If enabled (default `1`), drop configured noise tokens at the start of a new segment even when RMS is not low. |
+| `ECHO_LIVE_ASR_LOG_INTERVAL_SECONDS` | Interval for live ASR latency diagnostics in debug/log output (default `2.0`; set `0` to disable). |
 | `ECHO_LIVE_SEGMENT_PAUSE_SECONDS` | Main live UI segmentation trigger: finalize current draft when silence reaches this threshold (default `2.0`). |
 | `ECHO_UI_SEGMENT_SEMANTIC_MIN_CHARS` | Minimum chars required before sentence-ending punctuation can finalize a segment (default `80`). |
 | `ECHO_UI_SEGMENT_MAX_SECONDS` | Forced UI segment split when a draft grows too long in time (default `25`). |
@@ -127,7 +137,10 @@ Loads the same `.env` rules as the app (repo root then cwd), prints which LLM ro
 | `ECHO_INSIGHT_PAUSE_MIN_CHARS` | Minimum new chars required when triggering insights from idle pause (default `80`). |
 | `ECHO_INSIGHT_FINALIZED_SEGMENT_MIN_CHARS` | Minimum chars for a newly finalized segment to trigger insight directly (default `100`). |
 | `ECHO_INSIGHT_SKIP_MIN_CHARS` | Skip insight calls when new content is below this size (default `50`). |
-| `ECHO_INSIGHT_LIVE_MIN_INTERVAL` | Global live insight rate limiter in seconds (default `20`). |
+| `ECHO_INSIGHT_LIVE_MIN_INTERVAL` | Global live insight rate limiter in seconds (default `30`). |
+| `ECHO_ENABLE_TRANSCRIPT_REWRITE` | Enable LLM rewrite-back to Transcript (`1`/`true`, default). Set `0` to keep Transcript raw ASR text and disable LLM rewrite-back. |
+| `ECHO_DEBUG` | Enable debug panel/log events. Default is `0` (off). Set `1` to enable debug event output and log-file writing. |
+| `ECHO_DEBUG_PANEL_LINES` | Debug panel history cap. Default `0` means unlimited history (no truncation). |
 | `ECHO_OFFLINE` / `ECHO_ASSUME_ONLINE` / `ECHO_HF_LOCAL_ONLY` | See **Offline / LLM reachability** below. |
 | `ECHO_SYSTEM_AUDIO_CMD` | Override command for `--live-system-authorized` (if `--live-system-authorized-cmd` is omitted). Built-in default auto-compiles a bundled ScreenCaptureKit helper on macOS. Custom command must output `s16le`, 24kHz, stereo PCM to stdout. |
 
