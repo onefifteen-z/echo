@@ -144,7 +144,7 @@ def test_live_voice_gate_accepts_speech_like_chunk() -> None:
     )
 
 
-def test_should_trigger_insight_live_on_duration() -> None:
+def test_should_trigger_insight_live_skips_without_finalized_segment() -> None:
     from echo.app import _should_trigger_insight_live
 
     ok, reason = _should_trigger_insight_live(
@@ -161,8 +161,8 @@ def test_should_trigger_insight_live_on_duration() -> None:
         skip_min_chars=50,
         pause_seconds=2.0,
     )
-    assert ok is True
-    assert reason == "duration"
+    assert ok is False
+    assert reason == ""
 
 
 def test_insight_segments_signature_distinguishes_finalized_state() -> None:
@@ -207,7 +207,7 @@ def test_meaningful_new_content_since_comment_requires_delta_threshold() -> None
     )
 
 
-def test_should_trigger_insight_live_on_pause() -> None:
+def test_should_trigger_insight_live_skips_on_pause_without_finalized() -> None:
     from echo.app import _should_trigger_insight_live
 
     ok, reason = _should_trigger_insight_live(
@@ -224,11 +224,20 @@ def test_should_trigger_insight_live_on_pause() -> None:
         skip_min_chars=50,
         pause_seconds=2.0,
     )
-    assert ok is True
-    assert reason == "pause"
+    assert ok is False
+    assert reason == ""
 
 
-def test_should_trigger_insight_live_on_char_count() -> None:
+def test_render_asr_load_source_label() -> None:
+    from echo.app import _render_asr_load_source_label
+
+    assert _render_asr_load_source_label("local-cache-only") == "local cache only (offline mode)"
+    assert _render_asr_load_source_label("local-cache") == "local cache (no network fetch needed)"
+    assert _render_asr_load_source_label("hub-fetch") == "network (Hugging Face Hub fallback)"
+    assert _render_asr_load_source_label("other") == "unknown"
+
+
+def test_should_trigger_insight_live_skips_on_char_count_without_finalized() -> None:
     from echo.app import _should_trigger_insight_live
 
     ok, reason = _should_trigger_insight_live(
@@ -245,8 +254,8 @@ def test_should_trigger_insight_live_on_char_count() -> None:
         skip_min_chars=50,
         pause_seconds=2.0,
     )
-    assert ok is True
-    assert reason == "char_count"
+    assert ok is False
+    assert reason == ""
 
 
 def test_should_trigger_insight_live_stays_off_when_short_and_active() -> None:
@@ -372,3 +381,42 @@ def test_run_echo_uses_live_specific_insight_defaults(monkeypatch) -> None:
     assert captured["insight_min_chars"] == 220
     assert captured["insight_min_interval"] == 45.0
     assert captured["live_emit_interval"] == 0.0
+
+
+def test_run_echo_passes_meeting_output_configuration(monkeypatch) -> None:
+    from pathlib import Path
+
+    import echo.app as app
+
+    captured: dict[str, object] = {}
+
+    class DummyEchoApp:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self) -> None:
+            captured["ran"] = True
+
+    monkeypatch.setattr(app, "_load_dotenv_files", lambda: None)
+    monkeypatch.setattr(app, "echo_env_hub_local_only", lambda: False)
+    monkeypatch.setattr(app, "echo_llm_online", lambda: True)
+    monkeypatch.setattr(app, "EchoApp", DummyEchoApp)
+
+    out_dir = Path("/tmp/echo-test-output")
+    app.run_echo(
+        meeting_title="Weekly Sync",
+        meeting_context="Review blockers and next milestones.",
+        output_dir=out_dir,
+    )
+
+    assert captured["ran"] is True
+    assert captured["meeting_title"] == "Weekly Sync"
+    assert captured["meeting_context"] == "Review blockers and next milestones."
+    assert captured["output_dir"] == out_dir
+
+
+def test_meeting_title_to_folder_name_sanitizes_path_unsafe_chars() -> None:
+    from echo.app import meeting_title_to_folder_name
+
+    assert meeting_title_to_folder_name("Q2 / Planning: kickoff?") == "Q2 - Planning- kickoff-"
+    assert meeting_title_to_folder_name("   ") == "untitled-meeting"

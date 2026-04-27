@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import warnings
 
 # Avoid tokenizer/fork interactions when HF/transformers run from thread pools (macOS fds issues).
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import threading
+
+logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
 from pathlib import Path
 from typing import Iterator
 
@@ -19,6 +22,9 @@ _lock = threading.Lock()
 _processor = None
 _model = None
 _loaded_model_id: str | None = None
+_last_model_load_source: str | None = None
+_cached_dtype: object | None = None
+_cached_max_length: int | None = None
 
 
 def _require_asr_deps() -> None:
@@ -143,26 +149,46 @@ def _pick_device(explicit: str | None) -> str:
     return "cpu"
 
 
+def _load_whisper_assets(model_id: str, dtype: object, *, local_only: bool) -> tuple[object, object]:
+    from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+    proc = WhisperProcessor.from_pretrained(model_id, local_files_only=local_only)
+    mdl = WhisperForConditionalGeneration.from_pretrained(
+        model_id,
+        torch_dtype=dtype,
+        local_files_only=local_only,
+    )
+    return proc, mdl
+
+
 def ensure_model_loaded(model_id: str = MODEL_ID_DEFAULT, device: str | None = None) -> tuple[str, object, object]:
     """Load WhisperProcessor + WhisperForConditionalGeneration once (thread-safe)."""
-    global _processor, _model, _loaded_model_id
+    global _processor, _model, _loaded_model_id, _last_model_load_source
     _require_asr_deps()
     import torch
-    from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
     dev = _pick_device(device)
     with _lock:
         if _processor is not None and _model is not None and _loaded_model_id == model_id:
             return dev, _processor, _model
 
+        _cached_dtype = None
+        _cached_max_length = None
         _configure_hf_hub_http()
         dtype = torch.float16 if dev == "cuda" else torch.float32
         local_only = _load_local_only()
         try:
-            proc = WhisperProcessor.from_pretrained(model_id, local_files_only=local_only)
-            mdl = WhisperForConditionalGeneration.from_pretrained(
-                model_id, torch_dtype=dtype, local_files_only=local_only
-            )
+            if local_only:
+                proc, mdl = _load_whisper_assets(model_id, dtype, local_only=True)
+                _last_model_load_source = "local-cache-only"
+            else:
+                # Avoid Hub HEAD/etag checks when a complete snapshot already exists locally.
+                try:
+                    proc, mdl = _load_whisper_assets(model_id, dtype, local_only=True)
+                    _last_model_load_source = "local-cache"
+                except OSError:
+                    proc, mdl = _load_whisper_assets(model_id, dtype, local_only=False)
+                    _last_model_load_source = "hub-fetch"
         except OSError as e:
             if _exception_chain_mentions_tls(e):
                 raise OSError(
@@ -173,6 +199,8 @@ def ensure_model_loaded(model_id: str = MODEL_ID_DEFAULT, device: str | None = N
                     "       export SSL_CERT_FILE=...  or  REQUESTS_CA_BUNDLE=...\n"
                     "  2) As a last resort on a trusted network:\n"
                     "       export ECHO_HF_INSECURE_SSL=1\n"
+                    "If the model is already cached locally, set `ECHO_HF_LOCAL_ONLY=1` (or `HF_HUB_OFFLINE=1`) "
+                    "to force offline cache loading.\n"
                     f"Underlying error: {e}"
                 ) from e
             if local_only:
@@ -185,11 +213,24 @@ def ensure_model_loaded(model_id: str = MODEL_ID_DEFAULT, device: str | None = N
             raise
         mdl.eval()
         mdl.to(dev)
+        gc = getattr(mdl, "generation_config", None)
+        if gc is not None:
+            if getattr(gc, "forced_decoder_ids", None):
+                gc.forced_decoder_ids = None
+            if getattr(gc, "suppress_tokens", None) is not None:
+                gc.suppress_tokens = None
+            if getattr(gc, "begin_suppress_tokens", None) is not None:
+                gc.begin_suppress_tokens = None
 
         _processor = proc
         _model = mdl
         _loaded_model_id = model_id
         return dev, proc, mdl
+
+
+def get_last_model_load_source() -> str | None:
+    """Load source for the most recent successful model initialization."""
+    return _last_model_load_source
 
 
 def _load_audio_mono_16k(path: Path):
@@ -252,6 +293,7 @@ def transcribe_mono16k_chunk(
     language: str = "japanese",
 ) -> str:
     """Decode one mono float32 chunk at 16 kHz (Whisper). Returns empty string if too short."""
+    global _cached_dtype, _cached_max_length
     import numpy as np
     import torch
 
@@ -260,15 +302,22 @@ def transcribe_mono16k_chunk(
         return ""
 
     dev, processor, model = ensure_model_loaded(model_id, device)
-    forced_decoder_ids = processor.get_decoder_prompt_ids(language=language, task="transcribe")
-    dtype = next(model.parameters()).dtype
+
+    if _cached_dtype is None:
+        _cached_dtype = next(model.parameters()).dtype
+    if _cached_max_length is None:
+        _cached_max_length = _whisper_max_length(model)
+
     inputs = processor(x, sampling_rate=16000, return_tensors="pt")
-    feats = inputs.input_features.to(dev, dtype=dtype)
-    with torch.no_grad():
+    feats = inputs.input_features.to(dev, dtype=_cached_dtype)
+    attn_mask = torch.ones(feats.shape[:-1], dtype=torch.long, device=dev)
+    with torch.inference_mode():
         pred_ids = model.generate(
             feats,
-            forced_decoder_ids=forced_decoder_ids,
-            max_length=_whisper_max_length(model),
+            attention_mask=attn_mask,
+            language=language,
+            task="transcribe",
+            max_length=_cached_max_length,
         )
     return processor.batch_decode(pred_ids, skip_special_tokens=True)[0].strip()
 

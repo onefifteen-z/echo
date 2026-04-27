@@ -83,7 +83,7 @@ def test_llm_synthesize_web_findings_ja_mock(monkeypatch: pytest.MonkeyPatch) ->
     from echo.search import SearchHit
 
     async def fake_llm_user_text(content: str, _max_tokens: int) -> str:
-        assert "concise research summary" in content
+        assert "research blurb" in content or "research summary" in content
         assert "日経" in content or "FOMC" in content
         return "要約：公開情報は限定的だが、転写の意図は金利・指数の最新値確認である。"
 

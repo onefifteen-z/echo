@@ -11,6 +11,8 @@ from typing import Any, Literal
 
 from echo.search import SearchHit
 
+_openai_client_cache: dict[str, object] = {}
+_anthropic_client_cache: object | None = None
 
 AGENT_MD_MARKER = "## Echo runtime digest (injected into LLM prompts)"
 
@@ -60,9 +62,12 @@ def _build_insight_route_prompt(
     snippet: str,
     *,
     segments: list[tuple[int, str]] | None = None,
+    meeting_context: str = "",
 ) -> str:
     agent = _agent_digest_for_prompt()
     core = INSIGHT_ROUTE_CORE.replace("<<<AGENT>>>", agent.strip())
+    ctx_block = meeting_context.strip() if meeting_context else "(none)"
+    core = core.replace("<<<MEETING_CONTEXT>>>", ctx_block)
     prompt = _embed_snippet(core, snippet)
     if not segments:
         return prompt.replace("<<<SEGMENTS>>>", "(none)")
@@ -140,6 +145,28 @@ def _litellm_openai_config() -> tuple[str, str, str] | None:
     return base.rstrip("/"), key, model
 
 
+def _get_openai_client(api_key: str, base_url: str | None = None) -> Any:
+    global _openai_client_cache
+    cache_key = f"{api_key}:{base_url or ''}"
+    if cache_key not in _openai_client_cache:
+        from openai import AsyncOpenAI
+
+        kwargs: dict[str, Any] = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        _openai_client_cache[cache_key] = AsyncOpenAI(**kwargs)
+    return _openai_client_cache[cache_key]
+
+
+def _get_anthropic_client(api_key: str) -> Any:
+    global _anthropic_client_cache
+    if _anthropic_client_cache is None:
+        import anthropic
+
+        _anthropic_client_cache = anthropic.AsyncAnthropic(api_key=api_key)
+    return _anthropic_client_cache
+
+
 async def _openai_chat_completions(
     api_key: str,
     model: str,
@@ -148,12 +175,7 @@ async def _openai_chat_completions(
     *,
     base_url: str | None = None,
 ) -> str:
-    from openai import AsyncOpenAI
-
-    kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url:
-        kwargs["base_url"] = base_url
-    client = AsyncOpenAI(**kwargs)
+    client = _get_openai_client(api_key, base_url)
     resp = await client.chat.completions.create(
         model=model,
         messages=messages,
@@ -165,6 +187,11 @@ async def _openai_chat_completions(
 INSIGHT_ROUTE_CORE = """<<<AGENT>>>
 
 You route one meeting **transcript chunk** (may be imperfect ASR). Apply the digest above for transcript cleanup and for comment style.
+
+Meeting background/context (provided by user):
+<<<
+<<<MEETING_CONTEXT>>>
+>>>
 
 Return ONLY valid JSON (no markdown code fences) with exactly these keys:
 - "action": either "comment" or "web_search"
@@ -198,6 +225,11 @@ The transcript chunk may already be ASR-corrected (cleaned wording, same facts).
 Use the transcript chunk for context, the search query, and the web excerpts.
 If sources are empty or weak, say so in one line and lean on the transcript only.
 
+Meeting background/context (provided by user):
+<<<
+<<<MEETING_CONTEXT>>>
+>>>
+
 Transcript chunk:
 <<<
 <<<SNIPPET>>>
@@ -217,9 +249,13 @@ def _embed_snippet(template: str, snippet: str) -> str:
     return template.replace("<<<SNIPPET>>>", snippet)
 
 
-def _embed_synth(template: str, snippet: str, query: str, sources: str) -> str:
+def _embed_synth(
+    template: str, snippet: str, query: str, sources: str, meeting_context: str = "",
+) -> str:
+    ctx = meeting_context.strip() if meeting_context else "(none)"
     return (
-        template.replace("<<<SNIPPET>>>", snippet)
+        template.replace("<<<MEETING_CONTEXT>>>", ctx)
+        .replace("<<<SNIPPET>>>", snippet)
         .replace("<<<QUERY>>>", query)
         .replace("<<<SOURCES>>>", sources)
     )
@@ -251,9 +287,7 @@ async def _llm_user_text(content: str, max_tokens: int) -> str:
 
 
 async def _anthropic_user_text(api_key: str, content: str, max_tokens: int) -> str:
-    import anthropic
-
-    client = anthropic.AsyncAnthropic(api_key=api_key)
+    client = _get_anthropic_client(api_key)
     msg = await client.messages.create(
         model=os.environ.get("ECHO_ANTHROPIC_MODEL", "claude-3-5-haiku-20241022"),
         max_tokens=max_tokens,
@@ -349,13 +383,14 @@ async def llm_route_insight(
     transcript_snippet: str,
     *,
     segments: list[tuple[int, str]] | None = None,
+    meeting_context: str = "",
 ) -> InsightRouteResult:
     """Ask LLM to choose comment-only vs web_search. Without API keys, returns a comment explaining missing config."""
     snippet = transcript_snippet.strip()
     if not snippet:
         return InsightRouteResult("comment", "", "", "", "")
 
-    prompt = _build_insight_route_prompt(snippet, segments=segments)
+    prompt = _build_insight_route_prompt(snippet, segments=segments, meeting_context=meeting_context)
     raw = await _llm_user_text(prompt, 768)
     if not raw.strip():
         return InsightRouteResult(
@@ -415,11 +450,12 @@ async def llm_synthesize_web_findings(
     transcript_snippet: str,
     query: str,
     hits: list[SearchHit],
+    meeting_context: str = "",
 ) -> str:
     """Turn transcript + search hits into a short narrative summary."""
     snippet = transcript_snippet.strip()
     sources = _hits_bullets(hits)
-    prompt = _embed_synth(INSIGHT_SYNTH_TEMPLATE, snippet, query.strip(), sources)
+    prompt = _embed_synth(INSIGHT_SYNTH_TEMPLATE, snippet, query.strip(), sources, meeting_context)
     text = await _llm_user_text(prompt, 512)
     if not text.strip():
         return (
@@ -450,13 +486,15 @@ async def llm_keywords_and_summary(transcript_snippet: str) -> tuple[list[str], 
     return kws, summary
 
 
-async def llm_chat_answer(full_transcript: str, question: str) -> str:
+async def llm_chat_answer(
+    full_transcript: str, question: str, meeting_context: str = "",
+) -> str:
     if key := os.environ.get("ANTHROPIC_API_KEY"):
-        return await _anthropic_chat(key, full_transcript, question)
+        return await _anthropic_chat(key, full_transcript, question, meeting_context)
     if cfg := _litellm_openai_config():
-        return await _openai_compatible_chat(cfg, full_transcript, question)
+        return await _openai_compatible_chat(cfg, full_transcript, question, meeting_context)
     if key := os.environ.get("OPENAI_API_KEY"):
-        return await _openai_chat(key, full_transcript, question)
+        return await _openai_chat(key, full_transcript, question, meeting_context)
     return (
         "No API key detected. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, "
         "or LiteLLM-style BASE_URL + API_KEY + MODEL.\n"
@@ -465,9 +503,7 @@ async def llm_chat_answer(full_transcript: str, question: str) -> str:
 
 
 async def _anthropic_extract(api_key: str, snippet: str) -> tuple[list[str], str]:
-    import anthropic
-
-    client = anthropic.AsyncAnthropic(api_key=api_key)
+    client = _get_anthropic_client(api_key)
     msg = await client.messages.create(
         model=os.environ.get("ECHO_ANTHROPIC_MODEL", "claude-3-5-haiku-20241022"),
         max_tokens=512,
@@ -544,21 +580,26 @@ def _parse_kw_summary(text: str) -> tuple[list[str], str]:
         return extract_keywords_fallback(raw), raw[:400]
 
 
-async def _anthropic_chat(api_key: str, full_transcript: str, question: str) -> str:
-    import anthropic
+def _chat_prompt(full_transcript: str, question: str, meeting_context: str = "") -> str:
+    ctx = f"Meeting background/context:\n{meeting_context.strip()}\n\n" if meeting_context.strip() else ""
+    return (
+        "You answer questions about a meeting using the transcript as context.\n"
+        "Be concise. If unknown, say you do not know.\n\n"
+        f"{ctx}Transcript:\n{full_transcript}\n\nQuestion:\n{question}"
+    )
 
-    client = anthropic.AsyncAnthropic(api_key=api_key)
+
+async def _anthropic_chat(
+    api_key: str, full_transcript: str, question: str, meeting_context: str = "",
+) -> str:
+    client = _get_anthropic_client(api_key)
     msg = await client.messages.create(
         model=os.environ.get("ECHO_ANTHROPIC_MODEL", "claude-3-5-haiku-20241022"),
         max_tokens=1024,
         messages=[
             {
                 "role": "user",
-                "content": (
-                    "You answer questions about a meeting using the transcript as context.\n"
-                    "Be concise. If unknown, say you do not know.\n\n"
-                    f"Transcript:\n{full_transcript}\n\nQuestion:\n{question}"
-                ),
+                "content": _chat_prompt(full_transcript, question, meeting_context),
             }
         ],
     )
@@ -569,6 +610,7 @@ async def _openai_compatible_chat(
     cfg: tuple[str, str, str],
     full_transcript: str,
     question: str,
+    meeting_context: str = "",
 ) -> str:
     base_url, api_key, model = cfg
     return await _openai_chat_completions(
@@ -577,10 +619,7 @@ async def _openai_compatible_chat(
         [
             {
                 "role": "user",
-                "content": (
-                    "Answer using the meeting transcript. Be concise.\n\n"
-                    f"Transcript:\n{full_transcript}\n\nQuestion:\n{question}"
-                ),
+                "content": _chat_prompt(full_transcript, question, meeting_context),
             }
         ],
         1024,
@@ -588,7 +627,9 @@ async def _openai_compatible_chat(
     )
 
 
-async def _openai_chat(api_key: str, full_transcript: str, question: str) -> str:
+async def _openai_chat(
+    api_key: str, full_transcript: str, question: str, meeting_context: str = "",
+) -> str:
     model = os.environ.get("ECHO_OPENAI_MODEL", "gpt-4o-mini")
     return await _openai_chat_completions(
         api_key,
@@ -596,10 +637,7 @@ async def _openai_chat(api_key: str, full_transcript: str, question: str) -> str
         [
             {
                 "role": "user",
-                "content": (
-                    "Answer using the meeting transcript. Be concise.\n\n"
-                    f"Transcript:\n{full_transcript}\n\nQuestion:\n{question}"
-                ),
+                "content": _chat_prompt(full_transcript, question, meeting_context),
             }
         ],
         1024,

@@ -98,6 +98,18 @@ def main() -> None:
         default=None,
         help="Force torch device for ASR (default: auto, or ECHO_WHISPER_DEVICE).",
     )
+    p.add_argument(
+        "--meeting-title",
+        type=str,
+        default=None,
+        help="Meeting title. If omitted, Echo asks at startup.",
+    )
+    p.add_argument(
+        "--meeting-context",
+        type=str,
+        default=None,
+        help="Meeting background/context. If omitted, Echo asks at startup.",
+    )
     args = p.parse_args()
     if args.list_audio_devices:
         from echo.live_audio import list_input_devices
@@ -129,7 +141,6 @@ def main() -> None:
             live_sys = resolve_input_device(args.live_system_device, default=None)
         except ValueError as e:
             p.error(str(e))
-
     run_echo(
         replay_path=args.replay,
         line_delay=args.line_delay,
@@ -142,6 +153,8 @@ def main() -> None:
         live_system_device=live_sys,
         live_system_authorized=args.live_system_authorized,
         live_system_authorized_cmd=args.live_system_authorized_cmd,
+        meeting_title=(args.meeting_title or "").strip() or "untitled-meeting",
+        meeting_context=(args.meeting_context or "").strip(),
     )
 
 

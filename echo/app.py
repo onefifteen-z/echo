@@ -8,7 +8,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import date, timedelta
 from functools import partial
 from pathlib import Path
 from typing import Iterable, Literal
@@ -16,6 +16,7 @@ from typing import Iterable, Literal
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import Screen
 from textual.widgets import Collapsible, Footer, Header, Input, Markdown, RichLog, Rule, Static
 
 from echo.asr import MODEL_ID_DEFAULT
@@ -51,11 +52,82 @@ class TranscriptSegment:
     finalized: bool = True
 
 
+class MeetingSetupScreen(Screen[tuple[str, str]]):
+    """Full screen prompting for meeting title and context."""
+
+    DEFAULT_CSS = """
+    MeetingSetupScreen {
+        align: center middle;
+        background: $background;
+    }
+    #meeting-setup {
+        width: 72;
+        max-width: 90%;
+        height: auto;
+        border: tall $accent;
+        background: $panel;
+        padding: 2 3;
+    }
+    #meeting-setup-heading {
+        text-align: center;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #meeting-title-input {
+        margin-bottom: 1;
+    }
+    #meeting-context-input {
+        margin-bottom: 1;
+    }
+    #meeting-setup-hint {
+        text-align: center;
+    }
+    """
+
+    def __init__(self, *, title: str = "", context: str = "") -> None:
+        super().__init__()
+        self._init_title = _default_meeting_title(title)
+        self._init_context = context
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="meeting-setup"):
+            yield Static("Meeting Setup", id="meeting-setup-heading")
+            yield Static("Title:")
+            yield Input(
+                value=self._init_title,
+                placeholder="e.g. Weekly Sync",
+                id="meeting-title-input",
+            )
+            yield Static("Background / context:")
+            yield Input(
+                value=self._init_context,
+                placeholder="e.g. Review blockers and next milestones",
+                id="meeting-context-input",
+            )
+            yield Static(
+                "[dim]Enter in title -> moves to context.  Enter in context -> start.[/]",
+                id="meeting-setup-hint",
+                markup=True,
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#meeting-title-input", Input).focus()
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "meeting-title-input":
+            self.query_one("#meeting-context-input", Input).focus()
+            return
+        title = self.query_one("#meeting-title-input", Input).value.strip()
+        context = self.query_one("#meeting-context-input", Input).value.strip()
+        self.dismiss((title or _UNTITLED_MEETING, context))
+
+
 _LEADING_BRACKET_TS = re.compile(r"^(\[[^\]]+\]\s*)")
 _LIVE_LINE_SPAN_RE = re.compile(
     r"^\[(\d{2}):(\d{2}):(\d{2})[–-](\d{2}):(\d{2}):(\d{2})\]"
 )
 _LIVE_SENTENCE_END_RE = re.compile(r"[。！？!?]+$")
+_LIVE_SENTENCE_END_ANYWHERE_RE = re.compile(r"[。！？!?]")
 _LIVE_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?])\s*")
 _LIVE_CLAUSE_SPLIT_RE = re.compile(r"(?<=[、，,;；])\s*")
 _LIVE_STOP_WORDS_DEFAULT: tuple[str, ...] = (
@@ -72,6 +144,17 @@ _METER_FLOOR_DB = -60.0
 _METER_HISTORY_WIDTH = 52
 _METER_TIMELINE_LEVELS = " .:-=+*#%@"
 _METER_CHART_ROWS = 8
+_UNTITLED_MEETING = "untitled-meeting"
+
+
+def _default_meeting_title(title: str) -> str:
+    today = f"@{date.today().isoformat()}"
+    t = (title or "").strip()
+    if not t or t == _UNTITLED_MEETING:
+        return today
+    if today not in t:
+        return f"{t} {today}"
+    return t
 
 
 def _leading_ts_prefix(line: str) -> str:
@@ -95,6 +178,26 @@ def _line_span_seconds(line: str) -> tuple[float, float] | None:
 
 def _normalize_spaces(text: str) -> str:
     return " ".join(text.split())
+
+
+def meeting_title_to_folder_name(title: str) -> str:
+    clean = " ".join((title or "").split()).strip()
+    if not clean:
+        return _UNTITLED_MEETING
+    # Keep Unicode/spacing in folder names while avoiding path separators.
+    clean = clean.replace("/", "-").replace("\\", "-")
+    clean = re.sub(r'[:*?"<>|]+', "-", clean).strip().strip(".")
+    return clean or _UNTITLED_MEETING
+
+
+def _render_asr_load_source_label(source: str | None) -> str:
+    if source == "local-cache-only":
+        return "local cache only (offline mode)"
+    if source == "local-cache":
+        return "local cache (no network fetch needed)"
+    if source == "hub-fetch":
+        return "network (Hugging Face Hub fallback)"
+    return "unknown"
 
 
 def _trim_chunk_overlap(prev: str, cur: str, *, min_chars: int = 8, max_chars: int = 80) -> str:
@@ -356,21 +459,11 @@ def _should_trigger_insight_live(
 ) -> tuple[bool, str]:
     if new_chars < max(1, skip_min_chars):
         return False, ""
-    if new_chars >= max(1, min_chars):
-        return True, "char_count"
     if (
         new_finalized_segments >= 1
         and max_finalized_segment_chars >= max(1, finalized_segment_min_chars)
     ):
         return True, "new_segment"
-    if new_seconds >= max(0.1, min_seconds):
-        return True, "duration"
-    if (
-        idle_tick
-        and idle_for >= max(0.0, pause_seconds)
-        and new_chars >= max(1, pause_min_chars)
-    ):
-        return True, "pause"
     return False, ""
 
 
@@ -621,6 +714,10 @@ class EchoApp(App[None]):
         live_group_delay: float = 0.16,
         live_group_chars: int = 36,
         live_stop_words: tuple[str, ...] | None = None,
+        asr_load_source: str | None = None,
+        meeting_title: str = _UNTITLED_MEETING,
+        meeting_context: str = "",
+        output_dir: Path | None = None,
     ) -> None:
         super().__init__()
         self.replay_path = replay_path
@@ -665,6 +762,12 @@ class EchoApp(App[None]):
         self.model_id = model_id
         self.chunk_seconds = chunk_seconds
         self.whisper_device = whisper_device
+        self.asr_load_source = asr_load_source
+        self.meeting_title = (meeting_title or "").strip() or _UNTITLED_MEETING
+        self.meeting_context = (meeting_context or "").strip()
+        self.output_dir = output_dir or (Path.cwd() / "output" / meeting_title_to_folder_name(self.meeting_title))
+        self._workers_started = False
+        self._resume_after_setup = False
         self.live_asr_languages = ("japanese", "english")
         env_lang = (os.environ.get("ECHO_WHISPER_LANGUAGE") or "japanese").strip().lower() or "japanese"
         self.live_asr_language = (
@@ -674,6 +777,7 @@ class EchoApp(App[None]):
         )
         self._llm_offline = llm_offline
         self._live_wall_t0: float | None = None
+        self._live_reset_seq = 0
 
         self._paused = False
         self._t0 = time.monotonic()
@@ -727,7 +831,7 @@ class EchoApp(App[None]):
         )
         self.live_chunk_overlap_seconds = max(
             0.0,
-            float(os.environ.get("ECHO_LIVE_CHUNK_OVERLAP_SECONDS", "0.5")),
+            float(os.environ.get("ECHO_LIVE_CHUNK_OVERLAP_SECONDS", "0.3")),
         )
         self.live_segment_pause_seconds = max(
             0.3,
@@ -755,7 +859,7 @@ class EchoApp(App[None]):
         )
         self.ui_segment_max_chars = max(
             80,
-            int(os.environ.get("ECHO_UI_SEGMENT_MAX_CHARS", "360")),
+            int(os.environ.get("ECHO_UI_SEGMENT_MAX_CHARS", "460")),
         )
         self.insight_live_min_seconds = max(
             0.5,
@@ -856,13 +960,12 @@ class EchoApp(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
+        self._set_meeting_metadata(self.meeting_title, self.meeting_context)
         if self._llm_offline:
             self.query_one("#chat_log", RichLog).write(
                 "[dim]LLM unavailable (no API keys or TCP probe to the configured host failed): "
                 "Insights and chat are disabled. The Transcript panel still works (replay or ASR).[/]"
             )
-        if os.environ.get("ECHO_NO_SPLASH", "").lower() not in ("1", "true", "yes"):
-            self.push_screen(SplashScreen())
         if self.live_audio:
             mode = "Live ASR"
         elif self.audio_path is not None:
@@ -892,6 +995,43 @@ class EchoApp(App[None]):
         )
         if self._debug_log_path is not None:
             self._debug_note(f"debug log file: {self._debug_log_path}")
+        show_splash = os.environ.get("ECHO_NO_SPLASH", "").lower() not in ("1", "true", "yes")
+        if show_splash:
+            self.push_screen(SplashScreen(), callback=self._on_splash_done)
+        else:
+            self._open_meeting_setup()
+
+    def _on_splash_done(self, _result: object) -> None:
+        self._open_meeting_setup()
+
+    def _open_meeting_setup(self) -> None:
+        self.push_screen(
+            MeetingSetupScreen(
+                title=self.meeting_title, context=self.meeting_context,
+            ),
+            callback=self._on_meeting_setup_done,
+        )
+
+    def _on_meeting_setup_done(self, result: tuple[str, str]) -> None:
+        title, context = result
+        self._set_meeting_metadata(title, context)
+        if not self._workers_started:
+            self._start_workers()
+        if self._resume_after_setup:
+            self._paused = False
+            self._resume_after_setup = False
+            self.notify("Session reset", timeout=2)
+
+    def _set_meeting_metadata(self, title: str, context: str) -> None:
+        self.meeting_title = (title or "").strip() or _UNTITLED_MEETING
+        self.meeting_context = (context or "").strip()
+        self.output_dir = Path.cwd() / "output" / meeting_title_to_folder_name(self.meeting_title)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _start_workers(self) -> None:
+        if self._workers_started:
+            return
+        self._workers_started = True
         # Keep exclusive=False so the insight loop does not cancel transcription.
         self.run_worker(self._transcription_worker(), exclusive=False)
         self.run_worker(self._insight_worker(), exclusive=False)
@@ -1019,9 +1159,43 @@ class EchoApp(App[None]):
         self._debug_note(f"pause toggled -> {self._paused}")
 
     def action_save_transcript(self) -> None:
-        path = Path.cwd() / f"echo_transcript_{int(time.time())}.txt"
-        path.write_text("\n".join(self._lines), encoding="utf-8")
-        self.notify(f"Saved {path}", timeout=4)
+        self._save_meeting_outputs(show_notification=True)
+
+    def _save_meeting_outputs(self, *, show_notification: bool) -> None:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        notes_path = self.output_dir / "notes.txt"
+        insights_path = self.output_dir / "insights.md"
+        context_path = self.output_dir / "meeting_context.md"
+        notes_path.write_text("\n".join(self._lines), encoding="utf-8")
+        insights_path.write_text(self._insights_export_markdown(), encoding="utf-8")
+        context_path.write_text(self._meeting_context_markdown(), encoding="utf-8")
+        if show_notification:
+            self.notify(f"Saved notes and insights to {self.output_dir}", timeout=4)
+
+    def _meeting_context_markdown(self) -> str:
+        ctx = self.meeting_context or "_(none)_"
+        return f"# Meeting\n\n- Title: {self.meeting_title}\n\n## Context\n\n{ctx}\n"
+
+    def _insights_export_markdown(self) -> str:
+        lines: list[str] = [f"# Insights — {self.meeting_title}", ""]
+        if not self._insight_passes:
+            lines.append("_No insights generated yet._")
+            lines.append("")
+            return "\n".join(lines)
+        for rec in self._insight_passes:
+            heading = "Comment" if rec.kind == "comment" else "Research summary"
+            lines.append(f"## Pass {rec.n} @ {rec.stamp}")
+            lines.append("")
+            lines.append(f"### {heading}")
+            lines.append("")
+            lines.append(rec.body_md.strip() or "_(empty)_")
+            lines.append("")
+            if rec.web_md:
+                lines.append("### Web search")
+                lines.append("")
+                lines.append(rec.web_md.strip())
+                lines.append("")
+        return "\n".join(lines)
 
     def action_clear_chat(self) -> None:
         chat = self.query_one("#chat_log", RichLog)
@@ -1032,7 +1206,7 @@ class EchoApp(App[None]):
             )
 
     def action_reset(self) -> None:
-        self._paused = False
+        self._paused = True
         self._lines.clear()
         self._line_ids.clear()
         self._line_id_to_index.clear()
@@ -1048,6 +1222,11 @@ class EchoApp(App[None]):
         self._last_insight_submission_sig = ""
         self._last_comment_input_snapshot = ""
         self._force_live_insight_flush = False
+        while not self._transcript_queue.empty():
+            try:
+                self._transcript_queue.get_nowait()
+            except Exception:  # noqa: BLE001
+                break
         self._live_preview_text = ""
         self._live_meter_rms = 0.0
         self._live_meter_peak = 0.0
@@ -1056,6 +1235,7 @@ class EchoApp(App[None]):
         self._live_peak_hist = [0.0] * self.live_meter_history_width
         self._last_live_emitted_spoken = ""
         self._live_meter_note = "Listening..." if self.live_audio else "Available in --live mode."
+        self._live_reset_seq += 1
 
         self.query_one("#transcript", RichLog).clear()
         self.action_clear_chat()
@@ -1067,7 +1247,8 @@ class EchoApp(App[None]):
         if self.debug_enabled:
             self._tick_debug_panel()
         asyncio.create_task(self._refresh_insights_panel(tail=None))
-        self.notify("Session reset", timeout=2)
+        self._resume_after_setup = True
+        self._open_meeting_setup()
 
     def action_focus_insights(self) -> None:
         self.query_one("#insights", VerticalScroll).focus()
@@ -1084,8 +1265,13 @@ class EchoApp(App[None]):
         self._debug_note(f"live ASR language -> {self.live_asr_language}")
         self.notify(f"Live ASR language: {self.live_asr_language}", timeout=2)
 
-    def _log_transcript_meta(self, log: RichLog, text: str) -> None:
+    def on_unmount(self) -> None:
+        self._save_meeting_outputs(show_notification=False)
+
+    def _log_transcript_meta(self, log: RichLog, text: str, *, debug_only: bool = False) -> None:
         """Status / error lines above replay or ASR lines (preserved when transcript body is rewritten)."""
+        if debug_only and not self.debug_enabled:
+            return
         self._transcript_log_prefix.append(text)
         log.write(text)
 
@@ -1269,7 +1455,12 @@ class EchoApp(App[None]):
             if hub_local_only_from_env()
             else f"[dim]Loading `{self.model_id}` (first run may download ~3GB of weights)…[/]"
         )
-        self._log_transcript_meta(log, load_msg)
+        self._log_transcript_meta(log, load_msg, debug_only=True)
+        self._log_transcript_meta(
+            log,
+            f"[dim]ASR model load source: {_render_asr_load_source_label(self.asr_load_source)}.[/]",
+            debug_only=True,
+        )
         try:
             session = await asyncio.to_thread(
                 partial(
@@ -1287,7 +1478,7 @@ class EchoApp(App[None]):
             self._log_transcript_meta(log, f"[red]ASR init failed:[/] {e!s}")
             return
 
-        self._log_transcript_meta(log, "[dim]Transcription started (p = pause between chunks).[/]")
+        self._log_transcript_meta(log, "[dim]Transcription started (p = pause between chunks).[/]", debug_only=True)
         while True:
             while self._paused:
                 await asyncio.sleep(0.15)
@@ -1325,6 +1516,12 @@ class EchoApp(App[None]):
                 if hub_local_only_from_env()
                 else f"[dim]Live ASR (`{self.model_id}`) — model already loaded on the main thread.[/]"
             ),
+            debug_only=True,
+        )
+        self._log_transcript_meta(
+            log,
+            f"[dim]ASR model load source: {_render_asr_load_source_label(self.asr_load_source)}.[/]",
+            debug_only=True,
         )
 
         if self.live_system_authorized:
@@ -1349,6 +1546,7 @@ class EchoApp(App[None]):
                 "(System Audio Recording Only on macOS 14.2+, otherwise Screen Recording; "
                 "Microphone permission may also be requested). "
                 "Transcript appends continuously and creates a new segment only after a long pause.[/]",
+                debug_only=True,
             )
         elif self.live_system_device is None:
             self._log_transcript_meta(
@@ -1356,6 +1554,7 @@ class EchoApp(App[None]):
                 "[dim]Live: microphone only. Add --live-system-device (e.g. BlackHole 2ch index) "
                 "to mix system audio, or create an aggregate input in Audio MIDI Setup. "
                 "Transcript appends continuously and creates a new segment only after a long pause.[/]",
+                debug_only=True,
             )
         else:
             self._log_transcript_meta(
@@ -1363,6 +1562,7 @@ class EchoApp(App[None]):
                 "[dim]Live: microphone + second input (50/50 mono mix). "
                 "p = pause (discards audio while paused). "
                 "Transcript appends continuously and creates a new segment only after a long pause.[/]",
+                debug_only=True,
             )
 
         system_cap: LiveSystemAuthorizedCapture | None = None
@@ -1576,20 +1776,39 @@ class EchoApp(App[None]):
                 return ""
             if reason in ("pause", "paused", "capture_stopped", "stop"):
                 return reason
-            if len(spoken) >= self.ui_segment_max_chars:
-                return "max_chars"
-            span = _line_span_seconds(live_draft_segment.line)
-            if span is not None:
-                t0, t1 = span
-                if max(0.0, t1 - t0) >= self.ui_segment_max_seconds:
-                    return "max_seconds"
-            if (
-                _LIVE_SENTENCE_END_RE.search(spoken)
-                and len(spoken) >= self.ui_segment_semantic_min_chars
-            ):
-                return "sentence_end"
             if idle_for >= self.live_segment_pause_seconds:
                 return "pause"
+
+            over_limit = False
+            if len(spoken) >= self.ui_segment_max_chars:
+                over_limit = True
+            else:
+                span = _line_span_seconds(live_draft_segment.line)
+                if span is not None:
+                    t0, t1 = span
+                    if max(0.0, t1 - t0) >= self.ui_segment_max_seconds:
+                        over_limit = True
+
+            ends_at_sentence = _LIVE_SENTENCE_END_RE.search(spoken)
+
+            # Over length/time limit: prefer cutting at a sentence boundary,
+            # but if ASR output has no punctuation, cut immediately — the
+            # segment is already long enough.
+            if over_limit:
+                if ends_at_sentence:
+                    return "max_sentence"
+                if _LIVE_SENTENCE_END_ANYWHERE_RE.search(spoken):
+                    return "max_mid_sentence"
+                return "max_no_punct"
+
+            # Normal sentence-end: need a brief pause to avoid cutting
+            # between back-to-back sentences in continuous speech.
+            if (
+                ends_at_sentence
+                and len(spoken) >= self.ui_segment_semantic_min_chars
+                and idle_for >= min(self.live_segment_pause_seconds, 0.6)
+            ):
+                return "sentence_end"
             return ""
 
         async def _flush_pending(reason: str) -> None:
@@ -1620,6 +1839,21 @@ class EchoApp(App[None]):
                     if emitted and fin_reason in ("stop", "capture_stopped", "paused"):
                         self._force_live_insight_flush = True
                 return
+            if reason in ("pause", "paused", "capture_stopped", "stop"):
+                await _append_live_draft(
+                    t0w=pending_t0w,
+                    t1w=pending_t1w,
+                    text=joined,
+                    allow_correction=pending_allow_correction,
+                )
+                _clear_pending()
+                idle_for = (time.monotonic() - last_voiced_wall) if last_voiced_wall > 0 else 0.0
+                fin_reason = _draft_finalize_reason(reason=reason, idle_for=idle_for)
+                if fin_reason:
+                    emitted = await _finalize_live_draft(fin_reason)
+                    if emitted:
+                        self._force_live_insight_flush = True
+                return
             if joined == self._last_live_emitted_spoken:
                 self._debug_note("pause flush dropped identical segment")
             else:
@@ -1646,9 +1880,10 @@ class EchoApp(App[None]):
                     idle_tick
                     and self.live_emit_interval <= 0.0
                     and live_draft_segment is not None
-                    and idle_for >= self.live_segment_pause_seconds
                 ):
-                    await _flush_pending("pause")
+                    fin_reason = _draft_finalize_reason(reason="", idle_for=idle_for)
+                    if fin_reason:
+                        await _flush_pending(fin_reason)
                 return
             pending_duration = 0.0
             if pending_t0w is not None and pending_t1w is not None:
@@ -1666,13 +1901,33 @@ class EchoApp(App[None]):
 
         try:
             pause_drain_done = False
+            reset_seq = self._live_reset_seq
             while True:
                 while self._paused:
                     if not pause_drain_done:
-                        # On pause, finalize whatever ASR text is already queued instead of dropping it.
                         await _flush_pending("paused")
                         pause_drain_done = True
                     await asyncio.sleep(0.05)
+                if self._live_reset_seq != reset_seq:
+                    reset_seq = self._live_reset_seq
+                    _clear_pending()
+                    live_draft_segment = None
+                    live_draft_t0w = None
+                    live_draft_allow_correction = True
+                    live_draft_stable_after = 0.0
+                    live_draft_last_snapshot_text = ""
+                    live_draft_last_snapshot_at = 0.0
+                    last_chunk_text = ""
+                    last_voiced_wall = 0.0
+                    buf = np.array([], dtype=np.float32)
+                    self._live_wall_t0 = time.monotonic()
+                    self._last_live_emitted_spoken = ""
+                    while not cap.out_q.empty():
+                        try:
+                            cap.out_q.get_nowait()
+                        except Exception:  # noqa: BLE001
+                            break
+                    self._debug_note("live worker state reset")
                 pause_drain_done = False
 
                 block = await asyncio.to_thread(cap.read_block, 0.35)
@@ -1850,7 +2105,10 @@ class EchoApp(App[None]):
                 continue
             now = time.monotonic()
             if self.live_audio:
-                eligible = list(self._insight_buffer)
+                if self._force_live_insight_flush:
+                    eligible = list(self._insight_buffer)
+                else:
+                    eligible = [seg for seg in self._insight_buffer if seg.finalized]
             else:
                 eligible = [seg for seg in self._insight_buffer if seg.stable_after <= now]
             buf_text = "\n".join(seg.spoken_text for seg in eligible).strip()
@@ -2099,7 +2357,7 @@ class EchoApp(App[None]):
                             f"insight pass input segments={len(seg_payload)} ids={first_id}-{last_id}",
                         )
                     route = await asyncio.wait_for(
-                        llm_route_insight(snapshot, segments=seg_payload),
+                        llm_route_insight(snapshot, segments=seg_payload, meeting_context=self.meeting_context),
                         timeout=llm_timeout,
                     )
                 except asyncio.TimeoutError:
@@ -2181,7 +2439,7 @@ class EchoApp(App[None]):
                             ddg_err = f"ddgs: `{e!s}`"
                     try:
                         summary = await asyncio.wait_for(
-                            llm_synthesize_web_findings(ctx, query, hits),
+                            llm_synthesize_web_findings(ctx, query, hits, self.meeting_context),
                             timeout=llm_timeout,
                         )
                     except asyncio.TimeoutError:
@@ -2240,7 +2498,7 @@ class EchoApp(App[None]):
         chat.write(f"[bold cyan]You:[/] {q}")
         full = "\n".join(self._lines)
         try:
-            ans = await llm_chat_answer(full, q)
+            ans = await llm_chat_answer(full, q, self.meeting_context)
         except Exception as e:  # noqa: BLE001 — demo surface errors in UI
             ans = f"(error) {e!s}"
         chat.write(f"[bold green]AI:[/] {ans}")
@@ -2300,6 +2558,9 @@ def run_echo(
     live_system_device: int | None = None,
     live_system_authorized: bool = False,
     live_system_authorized_cmd: str | None = None,
+    meeting_title: str = _UNTITLED_MEETING,
+    meeting_context: str = "",
+    output_dir: Path | None = None,
 ) -> None:
     _load_dotenv_files()
     if live_system_authorized and not live_audio:
@@ -2307,6 +2568,7 @@ def run_echo(
     if echo_env_hub_local_only():
         os.environ.setdefault("ECHO_HF_LOAD_LOCAL_ONLY", "1")
     llm_ok = echo_llm_online()
+    asr_load_source: str | None = None
     if audio_path is not None or live_audio:
         import sys
 
@@ -2315,7 +2577,7 @@ def run_echo(
             if not ap.is_file():
                 raise FileNotFoundError(f"Audio file not found: {ap.resolve()}")
 
-        from echo.asr import ensure_model_loaded
+        from echo.asr import ensure_model_loaded, get_last_model_load_source
 
         if hub_local_only_from_env():
             print(
@@ -2343,6 +2605,12 @@ def run_echo(
             )
         # Main-thread load avoids HF subprocess + asyncio.to_thread + Textual (macOS fds_to_keep).
         ensure_model_loaded(model_id, whisper_device)
+        asr_load_source = get_last_model_load_source() or "unknown"
+        print(
+            f"Echo: ASR model load source: {asr_load_source}.",
+            file=sys.stderr,
+            flush=True,
+        )
     insight_min_chars = 220 if live_audio else 120
     insight_min_interval = 45.0 if live_audio else 25.0
     EchoApp(
@@ -2361,4 +2629,8 @@ def run_echo(
         live_system_authorized=live_system_authorized,
         live_system_authorized_cmd=live_system_authorized_cmd,
         live_emit_interval=0.0 if live_audio else 5.0,
+        asr_load_source=asr_load_source,
+        meeting_title=meeting_title,
+        meeting_context=meeting_context,
+        output_dir=output_dir,
     ).run()
