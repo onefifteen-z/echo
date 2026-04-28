@@ -16,10 +16,11 @@ _anthropic_client_cache: object | None = None
 
 AGENT_MD_MARKER = "## Echo runtime digest (injected into LLM prompts)"
 
-# Used when AGENT.md is missing or has no digest section.
+# Used when AGENT.md is missing or has no digest section (transcript + routing only; ``comment`` shape
+# comes from ``INSIGHT_COMMENT_STYLE_RULES`` inside ``INSIGHT_ROUTE_CORE``).
 _AGENT_DIGEST_FALLBACK = """**Transcript / ASR:** Treat input as noisy STT; return `corrected_transcript` with same meaning, fixing probable errors; never invent facts or new lines.
 
-**Comment (live meeting, scan in seconds):** Hard cap **~90 words** in `comment` (same language as transcript). Format: **one** headline conclusion sentence (So what) + **at most 2** very short bullets (facts from chunk only) + **one** closing line (Now what / decision). Use declarative statements only; do not ask questions and avoid `?`. No section headers unless essential.
+**Routing:** Choose `comment` vs `web_search` per the routing instructions below. When `action` is `comment`, the `comment` field must follow the **McKinsey-style rules** block at the top of the routed prompt (not repeated here).
 
 **Web search:** `comment` empty; sharp `search_query`; still return `corrected_transcript`."""
 
@@ -184,9 +185,19 @@ async def _openai_chat_completions(
     return (resp.choices[0].message.content or "").strip()
 
 
-INSIGHT_ROUTE_CORE = """<<<AGENT>>>
+# Shipped with the insight routing prompt only (do not rely on AGENT.md for this shape).
+INSIGHT_COMMENT_STYLE_RULES = """**Insight `comment` — McKinsey-style message (required when `action` is `comment`):**
+- **Pyramid:** Open with **one** sentence that states the **governing thought** (So what / the answer). No warm-up or “in this chunk…” framing.
+- **Support:** **At most 2** bullets; each must be a **distinct** point **grounded only in the chunk**; omit bullets if the lead alone is enough. Do not repeat the lead in bullets.
+- **Now what:** End with **one** line: concrete next step, decision, or owner—still declarative.
+- **~90 words** maximum for `comment`; same language as the transcript; **no questions** (avoid `?`); no section headers; do not name consulting frameworks (MECE, 7S, etc.) unless the transcript already uses them."""
 
-You route one meeting **transcript chunk** (may be imperfect ASR). Apply the digest above for transcript cleanup and for comment style.
+
+INSIGHT_ROUTE_CORE = f"""{INSIGHT_COMMENT_STYLE_RULES}
+
+<<<AGENT>>>
+
+You route one meeting **transcript chunk** (may be imperfect ASR). Apply the digest above for transcript cleanup and for routing; for `comment` body text, **always** apply the **McKinsey-style rules** block at the very top of this prompt (even if the digest repeats similar ideas).
 
 Meeting background/context (provided by user):
 <<<
@@ -196,8 +207,8 @@ Meeting background/context (provided by user):
 Return ONLY valid JSON (no markdown code fences) with exactly these keys:
 - "action": either "comment" or "web_search"
 - "corrected_transcript": string — same content as the raw chunk with probable ASR/typo/word-boundary fixes; **same language**; **do not** add facts, numbers, or lines not clearly grounded in the chunk. If nothing needs fixing, return the raw chunk verbatim.
-- "corrected_segments": array of objects with shape {"id": number, "text": string}. Use ONLY ids listed below. Keep line boundaries: do not merge or split segments. "text" must be content-only (no timestamps). If no segment-level edits, return [].
-- "comment": string (markdown). If action is "comment": **very short** live-meeting insight per digest: **one** lead conclusion sentence (So what) + **at most 2** bullets + **one** closing decision line (Now what); **hard cap ~90 words** total—people are in a meeting; declarative only (no questions, avoid `?`). If action is "web_search": empty string "".
+- "corrected_segments": array of objects with shape {{"id": number, "text": string}}. Use ONLY ids listed below. Keep line boundaries: do not merge or split segments. "text" must be content-only (no timestamps). If no segment-level edits, return [].
+- "comment": string (markdown). If action is "comment": write per the **McKinsey-style rules** at the top of this prompt. If action is "web_search": empty string "".
 - "search_query": string. If action is "web_search": concise keywords for a web search. If action is "comment": empty string "".
 - "reason": one short line explaining the routing choice.
 
@@ -242,7 +253,7 @@ Web excerpts (may be empty):
 <<<SOURCES>>>
 >>>
 
-Rules: same primary language as the transcript; **at most 2 short paragraphs** OR **one** paragraph + **up to 3** tight bullets; **hard cap ~110 words** total; lead with the takeaway; no JSON; no long lists."""
+Rules: same primary language as the transcript; **McKinsey-style executive blurb**—**lead with the takeaway** (pyramid), then tight supporting lines only from excerpts + transcript; **at most 2 short paragraphs** OR **one** paragraph + **up to 3** tight bullets; **hard cap ~110 words** total; declarative; no JSON; no long lists."""
 
 
 def _embed_snippet(template: str, snippet: str) -> str:

@@ -149,17 +149,10 @@ def test_should_trigger_insight_live_skips_without_finalized_segment() -> None:
 
     ok, reason = _should_trigger_insight_live(
         new_chars=80,
-        new_seconds=12.0,
         new_finalized_segments=0,
         max_finalized_segment_chars=0,
-        idle_tick=False,
-        idle_for=0.1,
-        min_chars=120,
-        min_seconds=10.0,
-        pause_min_chars=80,
         finalized_segment_min_chars=100,
         skip_min_chars=50,
-        pause_seconds=2.0,
     )
     assert ok is False
     assert reason == ""
@@ -212,17 +205,10 @@ def test_should_trigger_insight_live_skips_on_pause_without_finalized() -> None:
 
     ok, reason = _should_trigger_insight_live(
         new_chars=90,
-        new_seconds=2.0,
         new_finalized_segments=0,
         max_finalized_segment_chars=0,
-        idle_tick=True,
-        idle_for=2.5,
-        min_chars=220,
-        min_seconds=10.0,
-        pause_min_chars=80,
         finalized_segment_min_chars=100,
         skip_min_chars=50,
-        pause_seconds=2.0,
     )
     assert ok is False
     assert reason == ""
@@ -242,17 +228,10 @@ def test_should_trigger_insight_live_skips_on_char_count_without_finalized() -> 
 
     ok, reason = _should_trigger_insight_live(
         new_chars=240,
-        new_seconds=2.0,
         new_finalized_segments=0,
         max_finalized_segment_chars=0,
-        idle_tick=False,
-        idle_for=0.2,
-        min_chars=220,
-        min_seconds=10.0,
-        pause_min_chars=80,
         finalized_segment_min_chars=100,
         skip_min_chars=50,
-        pause_seconds=2.0,
     )
     assert ok is False
     assert reason == ""
@@ -263,17 +242,10 @@ def test_should_trigger_insight_live_stays_off_when_short_and_active() -> None:
 
     ok, reason = _should_trigger_insight_live(
         new_chars=40,
-        new_seconds=12.0,
         new_finalized_segments=1,
         max_finalized_segment_chars=200,
-        idle_tick=False,
-        idle_for=0.2,
-        min_chars=120,
-        min_seconds=10.0,
-        pause_min_chars=80,
         finalized_segment_min_chars=100,
         skip_min_chars=50,
-        pause_seconds=2.0,
     )
     assert ok is False
     assert reason == ""
@@ -284,17 +256,10 @@ def test_should_trigger_insight_live_on_new_finalized_segment() -> None:
 
     ok, reason = _should_trigger_insight_live(
         new_chars=120,
-        new_seconds=4.0,
         new_finalized_segments=1,
         max_finalized_segment_chars=120,
-        idle_tick=False,
-        idle_for=0.1,
-        min_chars=220,
-        min_seconds=10.0,
-        pause_min_chars=80,
         finalized_segment_min_chars=100,
         skip_min_chars=50,
-        pause_seconds=2.0,
     )
     assert ok is True
     assert reason == "new_segment"
@@ -354,6 +319,23 @@ def test_should_flush_live_pending_on_pause_idle_tick_only() -> None:
     )
     assert ok2 is True
     assert reason2 == "pause"
+
+
+def test_live_config_capture_out_q_drop_from_env() -> None:
+    from echo.config import LiveConfig
+
+    c0 = LiveConfig.from_env({})
+    assert c0.capture_out_q_drop_threshold == 400
+    assert c0.capture_out_q_drop_batch == 30
+
+    c1 = LiveConfig.from_env(
+        {
+            "ECHO_LIVE_CAPTURE_OUT_Q_DROP_THRESHOLD": "0",
+            "ECHO_LIVE_CAPTURE_OUT_Q_DROP_BATCH": "12",
+        },
+    )
+    assert c1.capture_out_q_drop_threshold == 0
+    assert c1.capture_out_q_drop_batch == 12
 
 
 def test_run_echo_uses_live_specific_insight_defaults(monkeypatch) -> None:
@@ -420,3 +402,33 @@ def test_meeting_title_to_folder_name_sanitizes_path_unsafe_chars() -> None:
 
     assert meeting_title_to_folder_name("Q2 / Planning: kickoff?") == "Q2 - Planning- kickoff-"
     assert meeting_title_to_folder_name("   ") == "untitled-meeting"
+
+
+def test_pause_drain_quiescent_requires_empty_outq_and_no_pending_windows() -> None:
+    from unittest.mock import MagicMock
+
+    import numpy as np
+
+    from echo.live_session import LiveTranscriptionSession
+
+    app = MagicMock()
+    app.live_asr_language = "ja"
+    log = MagicMock()
+    s = LiveTranscriptionSession(app, log)
+    s._chunk_samples = 8000
+    s._hop_samples = 4000
+    s._cap = MagicMock()
+    s._cap.out_q = MagicMock()
+    s._cap.out_q.qsize = lambda: 0
+    assert s._pause_drain_quiescent()
+
+    s._cap.out_q.qsize = lambda: 2
+    assert not s._pause_drain_quiescent()
+
+    s._cap.out_q.qsize = lambda: 0
+    s._audio_blocks.append(np.zeros(16000, dtype=np.float32))
+    assert not s._pause_drain_quiescent()
+
+    s._audio_blocks.clear()
+    s._cap = None
+    assert not s._pause_drain_quiescent()

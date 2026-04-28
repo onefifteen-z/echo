@@ -20,6 +20,7 @@ from textual.screen import Screen
 from textual.widgets import Collapsible, Footer, Header, Input, Markdown, RichLog, Rule, Static
 
 from echo.asr import MODEL_ID_DEFAULT
+from echo.config import EchoConfig
 from echo.connectivity import echo_env_hub_local_only, echo_llm_online, hub_local_only_from_env
 from echo.splash import SplashScreen
 from echo.llm import (
@@ -29,6 +30,7 @@ from echo.llm import (
     llm_synthesize_web_findings,
 )
 from echo.search import SearchHit, duckduckgo_search
+from echo.text_utils import format_timestamp_hms
 
 
 @dataclass
@@ -130,15 +132,6 @@ _LIVE_SENTENCE_END_RE = re.compile(r"[。！？!?]+$")
 _LIVE_SENTENCE_END_ANYWHERE_RE = re.compile(r"[。！？!?]")
 _LIVE_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?])\s*")
 _LIVE_CLAUSE_SPLIT_RE = re.compile(r"(?<=[、，,;；])\s*")
-_LIVE_STOP_WORDS_DEFAULT: tuple[str, ...] = (
-    "that's all",
-    "thank you",
-    "over",
-    "next topic",
-    "以上",
-    "以上です",
-    "谢谢",
-)
 _METER_BAR_WIDTH = 26
 _METER_FLOOR_DB = -60.0
 _METER_HISTORY_WIDTH = 52
@@ -445,18 +438,19 @@ def _passes_live_voice_gate(
 def _should_trigger_insight_live(
     *,
     new_chars: int,
-    new_seconds: float,
     new_finalized_segments: int,
     max_finalized_segment_chars: int,
-    idle_tick: bool,
-    idle_for: float,
-    min_chars: int,
-    min_seconds: float,
-    pause_min_chars: int,
     finalized_segment_min_chars: int,
     skip_min_chars: int,
-    pause_seconds: float,
 ) -> tuple[bool, str]:
+    """Decide whether to fire an insight pass for the current live transcript buffer.
+
+    The live insight policy is intentionally simple: only fire after the live worker has finalized
+    at least one segment that crosses ``finalized_segment_min_chars``, and the total buffered text
+    crosses ``skip_min_chars``. Time-based / pause-based triggers were experimented with and
+    removed because they fired noisy passes mid-thought; they are kept out of the signature on
+    purpose to avoid suggesting they are wired up.
+    """
     if new_chars < max(1, skip_min_chars):
         return False, ""
     if (
@@ -733,39 +727,38 @@ class EchoApp(App[None]):
         self.live_emit_interval = max(0.0, live_emit_interval)
         self.live_group_delay = max(0.0, live_group_delay)
         self.live_group_chars = max(12, live_group_chars)
+
+        # All env-driven knobs go through the typed config so defaults live in one place.
+        cfg = EchoConfig.from_env()
+        self.config = cfg
+        live_cfg = cfg.live
+        ui_cfg = cfg.ui_segment
+        ins_cfg = cfg.insight
+
+        # An explicit ``live_stop_words`` ctor arg overrides the env-driven default.
         if live_stop_words is None:
-            env_words = os.environ.get("ECHO_LIVE_STOP_WORDS", "")
-            words = [w.strip() for w in env_words.split(",") if w.strip()]
-            self.live_stop_words = tuple(words) if words else _LIVE_STOP_WORDS_DEFAULT
+            self.live_stop_words = live_cfg.stop_words
         else:
             self.live_stop_words = tuple(w.strip() for w in live_stop_words if w.strip())
-        noise_words = [
-            w.strip() for w in os.environ.get("ECHO_LIVE_NOISE_TOKENS", "ごめん").split(",") if w.strip()
-        ]
-        self.live_noise_tokens = tuple(noise_words)
-        always_drop_noise_words = [
-            w.strip() for w in os.environ.get("ECHO_LIVE_ALWAYS_DROP_NOISE_TOKENS", "ごめん").split(",") if w.strip()
-        ]
-        self.live_always_drop_noise_tokens = tuple(always_drop_noise_words)
-        self.live_noise_max_chars = max(
-            1,
-            int(os.environ.get("ECHO_LIVE_NOISE_MAX_CHARS", "4")),
-        )
-        self.live_noise_max_rms_factor = max(
-            0.1,
-            float(os.environ.get("ECHO_LIVE_NOISE_MAX_RMS_FACTOR", "1.3")),
-        )
-        self.live_noise_drop_at_segment_start = (
-            os.environ.get("ECHO_LIVE_NOISE_DROP_AT_SEGMENT_START", "1").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
+        self.live_noise_tokens = live_cfg.noise_tokens
+        self.live_always_drop_noise_tokens = live_cfg.always_drop_noise_tokens
+        self.live_noise_max_chars = live_cfg.noise_max_chars
+        self.live_noise_max_rms_factor = live_cfg.noise_max_rms_factor
+        self.live_noise_drop_at_segment_start = live_cfg.noise_drop_at_segment_start
         self.model_id = model_id
         self.chunk_seconds = chunk_seconds
         self.whisper_device = whisper_device
         self.asr_load_source = asr_load_source
         self.meeting_title = (meeting_title or "").strip() or _UNTITLED_MEETING
         self.meeting_context = (meeting_context or "").strip()
-        self.output_dir = output_dir or (Path.cwd() / "output" / meeting_title_to_folder_name(self.meeting_title))
+        # Remember an explicit output_dir so the in-app meeting setup screen does not silently
+        # override what the CLI / programmatic caller asked for.
+        self._explicit_output_dir = Path(output_dir) if output_dir is not None else None
+        self.output_dir = (
+            self._explicit_output_dir
+            if self._explicit_output_dir is not None
+            else Path.cwd() / "output" / meeting_title_to_folder_name(self.meeting_title)
+        )
         self._workers_started = False
         self._resume_after_setup = False
         self.live_asr_languages = ("japanese", "english")
@@ -787,9 +780,14 @@ class EchoApp(App[None]):
         self._line_id_to_spoken: dict[int, str] = {}
         self._line_id_to_flushed: dict[int, bool] = {}
         self._next_line_id = 1
+        # Number of RichLog strip rows occupied by the last appended/refreshed transcript line.
+        # Used by ``_refresh_last_transcript_line`` to replace just the trailing draft line.
+        self._draft_log_strip_count = 0
         self._transcript_log_prefix: list[str] = []
         self._transcript_queue: asyncio.Queue[object] = asyncio.Queue()
-        self._insight_buffer: list[TranscriptSegment] = []
+        # Insight staging: dict for O(1) line updates + stable order for snapshot/join.
+        self._insight_seg_by_id: dict[int, TranscriptSegment] = {}
+        self._insight_seg_order: list[int] = []
         self._insight_line_state: dict[int, tuple[str, bool]] = {}
         self._last_insight_at = time.monotonic()
         self._last_transcript_activity_at = time.monotonic()
@@ -799,96 +797,43 @@ class EchoApp(App[None]):
         self._eof_sentinel = "__ECHO_EOF__"
         self._insight_passes: list[InsightPassRecord] = []
         self._force_live_insight_flush = False
+        # Track in-flight insight tasks so reset can cancel them and avoid late writes.
+        self._insight_tasks: set[asyncio.Task[None]] = set()
+        self._insight_session_id = 0
+        # Incremental insight-panel rendering state (avoid full re-mount on every refresh).
+        self._rendered_pass_count = 0
+        self._insight_header_mounted = False
+        self._insight_tail_widgets: list = []
         self._live_meter_rms = 0.0
         self._live_meter_peak = 0.0
         self._live_meter_last_signal_at = 0.0
         self._live_meter_note = "Listening..." if self.live_audio else "Available in --live mode."
-        self.live_meter_history_width = max(
-            16,
-            int(os.environ.get("ECHO_LIVE_METER_HISTORY_WIDTH", str(_METER_HISTORY_WIDTH))),
-        )
+        self.live_meter_history_width = live_cfg.meter_history_width
         self._live_rms_hist: list[float] = [0.0] * self.live_meter_history_width
         self._live_peak_hist: list[float] = [0.0] * self.live_meter_history_width
-        self._live_preview_text = ""
-        self.live_char_delay = max(
-            0.0,
-            float(os.environ.get("ECHO_LIVE_CHAR_DELAY", "0.025")),
-        )
-        self.live_min_rms = max(
-            0.0,
-            float(os.environ.get("ECHO_LIVE_MIN_RMS", "0.0035")),
-        )
-        self.live_active_amp = max(
-            1e-4,
-            float(os.environ.get("ECHO_LIVE_ACTIVE_AMP", "0.012")),
-        )
-        self.live_min_active_ratio = min(
-            1.0,
-            max(
-                0.0,
-                float(os.environ.get("ECHO_LIVE_MIN_ACTIVE_RATIO", "0.015")),
-            ),
-        )
-        self.live_chunk_overlap_seconds = max(
-            0.0,
-            float(os.environ.get("ECHO_LIVE_CHUNK_OVERLAP_SECONDS", "0.3")),
-        )
-        self.live_segment_pause_seconds = max(
-            0.3,
-            float(os.environ.get("ECHO_LIVE_SEGMENT_PAUSE_SECONDS", "2.0")),
-        )
-        self.live_overlap_min_chars = max(
-            1,
-            int(os.environ.get("ECHO_LIVE_OVERLAP_MIN_CHARS", "2")),
-        )
-        self.live_rewrite_stable_seconds = max(
-            0.0,
-            float(os.environ.get("ECHO_LIVE_REWRITE_STABLE_SECONDS", "10.0")),
-        )
-        self.live_asr_log_interval_seconds = max(
-            0.0,
-            float(os.environ.get("ECHO_LIVE_ASR_LOG_INTERVAL_SECONDS", "2.0")),
-        )
-        self.ui_segment_semantic_min_chars = max(
-            1,
-            int(os.environ.get("ECHO_UI_SEGMENT_SEMANTIC_MIN_CHARS", "80")),
-        )
-        self.ui_segment_max_seconds = max(
-            4.0,
-            float(os.environ.get("ECHO_UI_SEGMENT_MAX_SECONDS", "25.0")),
-        )
-        self.ui_segment_max_chars = max(
-            80,
-            int(os.environ.get("ECHO_UI_SEGMENT_MAX_CHARS", "460")),
-        )
-        self.insight_live_min_seconds = max(
-            0.5,
-            float(os.environ.get("ECHO_INSIGHT_LIVE_MIN_SECONDS", "10.0")),
-        )
-        self.insight_pause_min_chars = max(
-            1,
-            int(os.environ.get("ECHO_INSIGHT_PAUSE_MIN_CHARS", "80")),
-        )
-        self.insight_finalized_segment_min_chars = max(
-            1,
-            int(os.environ.get("ECHO_INSIGHT_FINALIZED_SEGMENT_MIN_CHARS", "100")),
-        )
-        self.insight_skip_min_chars = max(
-            1,
-            int(os.environ.get("ECHO_INSIGHT_SKIP_MIN_CHARS", "50")),
-        )
-        self.insight_pause_seconds = max(
-            0.2,
-            float(os.environ.get("ECHO_INSIGHT_PAUSE_SECONDS", "3.0")),
-        )
-        self.insight_live_min_interval = max(
-            0.5,
-            float(os.environ.get("ECHO_INSIGHT_LIVE_MIN_INTERVAL", "30.0")),
-        )
-        self.enable_transcript_rewrite = (
-            os.environ.get("ECHO_ENABLE_TRANSCRIPT_REWRITE", "1").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
+        self.live_min_rms = live_cfg.min_rms
+        self.live_active_amp = live_cfg.active_amp
+        self.live_min_active_ratio = live_cfg.min_active_ratio
+        self.live_chunk_overlap_seconds = live_cfg.chunk_overlap_seconds
+        self.live_segment_pause_seconds = live_cfg.segment_pause_seconds
+        self.live_overlap_min_chars = live_cfg.overlap_min_chars
+        self.live_rewrite_stable_seconds = live_cfg.rewrite_stable_seconds
+        self.live_asr_log_interval_seconds = live_cfg.asr_log_interval_seconds
+        self.ui_segment_semantic_min_chars = ui_cfg.semantic_min_chars
+        self.ui_segment_max_seconds = ui_cfg.max_seconds
+        self.ui_segment_max_chars = ui_cfg.max_chars
+        self.insight_live_min_seconds = ins_cfg.live_min_seconds
+        self.insight_pause_min_chars = ins_cfg.pause_min_chars
+        self.insight_finalized_segment_min_chars = ins_cfg.finalized_segment_min_chars
+        self.insight_skip_min_chars = ins_cfg.skip_min_chars
+        self.insight_pause_seconds = ins_cfg.pause_seconds
+        self.insight_live_min_interval = ins_cfg.live_min_interval
+        self.insight_pause_capture_q = ins_cfg.pause_capture_q
+        self.enable_transcript_rewrite = ins_cfg.enable_transcript_rewrite
+        # Last seen live capture ``out_q`` depth (``LiveTranscriptionSession`` updates). -1 = unknown.
+        self._live_capture_queue_depth: int = -1
+        self._last_capture_backlog_debug_at: float = 0.0
+        self.chat_context_max_lines = cfg.chat_context_max_lines
         self.debug_enabled = (
             os.environ.get("ECHO_DEBUG", "0").strip().lower()
             in ("1", "true", "yes", "on")
@@ -978,6 +923,19 @@ class EchoApp(App[None]):
         self.set_interval(0.15, self._tick_input_meter)
         if self.debug_enabled:
             self.set_interval(0.2, self._tick_debug_panel)
+        if self.live_audio:
+            insight_dbg = (
+                f"insight_live[min_chars={self.insight_min_chars},min_sec={self.insight_live_min_seconds:.1f}s,"
+                f"pause={self.insight_pause_seconds:.1f}s,pause_min={self.insight_pause_min_chars},"
+                f"seg_min={self.insight_finalized_segment_min_chars},skip_min={self.insight_skip_min_chars},"
+                f"min_interval={self.insight_live_min_interval:.1f}s,"
+                f"pause_cap_q={self.insight_pause_capture_q}]"
+            )
+        else:
+            insight_dbg = (
+                f"insight_replay[min_chars={self.insight_min_chars},"
+                f"min_interval={self.insight_min_interval:.1f}s]"
+            )
         self._debug_note(
             "startup "
             f"mode={mode} live={self.live_audio} stable={self.live_rewrite_stable_seconds:.1f}s "
@@ -988,10 +946,7 @@ class EchoApp(App[None]):
             f"rewrite={'on' if self.enable_transcript_rewrite else 'off'} "
             f"debug={'on' if self.debug_enabled else 'off'} "
             f"lang={self.live_asr_language} "
-            f"insight[min_chars={self.insight_min_chars},min_seconds={self.insight_live_min_seconds:.1f}s,"
-            f"pause={self.insight_pause_seconds:.1f}s,pause_min={self.insight_pause_min_chars},"
-            f"seg_min={self.insight_finalized_segment_min_chars},skip_min={self.insight_skip_min_chars},"
-            f"min_interval={self.insight_live_min_interval:.1f}s]",
+            f"{insight_dbg}",
         )
         if self._debug_log_path is not None:
             self._debug_note(f"debug log file: {self._debug_log_path}")
@@ -1025,7 +980,9 @@ class EchoApp(App[None]):
     def _set_meeting_metadata(self, title: str, context: str) -> None:
         self.meeting_title = (title or "").strip() or _UNTITLED_MEETING
         self.meeting_context = (context or "").strip()
-        self.output_dir = Path.cwd() / "output" / meeting_title_to_folder_name(self.meeting_title)
+        # Honor a caller-supplied output_dir (e.g. CLI --output-dir) across meeting-title changes.
+        if self._explicit_output_dir is None:
+            self.output_dir = Path.cwd() / "output" / meeting_title_to_folder_name(self.meeting_title)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def _start_workers(self) -> None:
@@ -1107,22 +1064,6 @@ class EchoApp(App[None]):
             chart_cols = max(8, min(self.live_meter_history_width, (meter.size.width - 4) // 2))
         meter.update(self._input_meter_text(chart_cols=chart_cols))
 
-    def _live_preview_view(self) -> str:
-        if not self.live_audio:
-            return "Local ASR preview\navailable in --live mode"
-        if self._paused:
-            state = "Local ASR preview · paused"
-        elif self._live_preview_text:
-            state = "Local ASR preview · typing"
-        else:
-            state = "Local ASR preview · waiting"
-        preview = self._live_preview_text or "..."
-        return f"{state}\n{preview}"
-
-    def _tick_live_preview(self) -> None:
-        # Local preview panel is intentionally disabled to reduce duplicate/competing signals.
-        return
-
     def _debug_note(self, message: str) -> None:
         if not self.debug_enabled:
             return
@@ -1153,9 +1094,6 @@ class EchoApp(App[None]):
         self._paused = not self._paused
         if self.live_audio:
             self._live_meter_note = "Paused" if self._paused else "Listening"
-            if self._paused:
-                self._live_preview_text = ""
-            self._tick_live_preview()
         self._debug_note(f"pause toggled -> {self._paused}")
 
     def action_save_transcript(self) -> None:
@@ -1207,16 +1145,28 @@ class EchoApp(App[None]):
 
     def action_reset(self) -> None:
         self._paused = True
+        # Cancel any in-flight insight passes so their late writes do not pollute the new session.
+        self._insight_session_id += 1
+        for task in list(self._insight_tasks):
+            if not task.done():
+                task.cancel()
+        self._insight_tasks.clear()
         self._lines.clear()
         self._line_ids.clear()
         self._line_id_to_index.clear()
         self._line_id_to_spoken.clear()
         self._line_id_to_flushed.clear()
         self._next_line_id = 1
+        self._draft_log_strip_count = 0
         self._transcript_log_prefix.clear()
-        self._insight_buffer.clear()
+        self._insight_seg_by_id.clear()
+        self._insight_seg_order.clear()
         self._insight_line_state.clear()
         self._insight_passes.clear()
+        # Force the next refresh to do a full rebuild since the rendered prefix is gone.
+        self._rendered_pass_count = 0
+        self._insight_header_mounted = False
+        self._insight_tail_widgets = []
         self._last_insight_at = time.monotonic()
         self._last_transcript_activity_at = self._last_insight_at
         self._last_insight_submission_sig = ""
@@ -1227,7 +1177,6 @@ class EchoApp(App[None]):
                 self._transcript_queue.get_nowait()
             except Exception:  # noqa: BLE001
                 break
-        self._live_preview_text = ""
         self._live_meter_rms = 0.0
         self._live_meter_peak = 0.0
         self._live_meter_last_signal_at = 0.0
@@ -1242,7 +1191,6 @@ class EchoApp(App[None]):
         self._debug_events.clear()
         self._debug_note("session reset")
 
-        self._tick_live_preview()
         self._tick_input_meter()
         if self.debug_enabled:
             self._tick_debug_panel()
@@ -1266,7 +1214,11 @@ class EchoApp(App[None]):
         self.notify(f"Live ASR language: {self.live_asr_language}", timeout=2)
 
     def on_unmount(self) -> None:
-        self._save_meeting_outputs(show_notification=False)
+        # Failures here must not block app shutdown (slow disk, permission errors, etc.).
+        try:
+            self._save_meeting_outputs(show_notification=False)
+        except Exception:  # noqa: BLE001
+            self.log.exception("on_unmount: failed to save meeting outputs")
 
     def _log_transcript_meta(self, log: RichLog, text: str, *, debug_only: bool = False) -> None:
         """Status / error lines above replay or ASR lines (preserved when transcript body is rewritten)."""
@@ -1280,13 +1232,49 @@ class EchoApp(App[None]):
         log.clear()
         for m in self._transcript_log_prefix:
             log.write(m)
+        # Track strip counts so the per-chunk draft update can replace just the last line later.
+        self._draft_log_strip_count = 0
         for line_id, line in zip(self._line_ids, self._lines, strict=True):
-            log.write(self._render_transcript_line(line_id, line))
+            self._draft_log_strip_count = self._write_transcript_line(log, line_id, line)
 
     def _render_transcript_line(self, line_id: int, line: str) -> str:
         if self._line_id_to_flushed.get(line_id, False):
             return f"[white]{line}[/]"
         return f"[dim]{line}[/]"
+
+    def _write_transcript_line(self, log: RichLog, line_id: int, line: str) -> int:
+        """Write one transcript line and return how many strip rows it occupied."""
+        rendered = self._render_transcript_line(line_id, line)
+        before = len(log.lines)
+        log.write(rendered)
+        return max(0, len(log.lines) - before)
+
+    async def _refresh_last_transcript_line(self) -> None:
+        """Fast path for live draft growth: replace just the trailing draft line in the RichLog.
+
+        The previous implementation called ``log.clear()`` + rewrite-everything per ASR chunk,
+        which scaled badly with meeting length. This pops the strip rows of the last write and
+        writes the updated line back. Falls back to a full refresh if internal state looks off
+        (defensive against future Textual changes).
+        """
+        if not self._line_ids:
+            await self._refresh_transcript_log()
+            return
+        log = self.query_one("#transcript", RichLog)
+        last_strip_count = getattr(self, "_draft_log_strip_count", 0)
+        if last_strip_count <= 0 or last_strip_count > len(log.lines):
+            await self._refresh_transcript_log()
+            return
+        try:
+            for _ in range(last_strip_count):
+                log.lines.pop()
+            log.refresh()
+        except Exception:  # noqa: BLE001 — Textual internals not contractually stable
+            await self._refresh_transcript_log()
+            return
+        line_id = self._line_ids[-1]
+        line = self._lines[-1]
+        self._draft_log_strip_count = self._write_transcript_line(log, line_id, line)
 
     async def _emit_transcript_line(
         self,
@@ -1314,7 +1302,8 @@ class EchoApp(App[None]):
         self._line_id_to_flushed[seg.line_id] = False
         self._line_ids.append(seg.line_id)
         self._lines.append(line)
-        log.write(self._render_transcript_line(seg.line_id, line))
+        # Track the strip count so a follow-up draft mutation can replace only this line.
+        self._draft_log_strip_count = self._write_transcript_line(log, seg.line_id, line)
         if enqueue:
             await self._transcript_queue.put(seg)
         if self.live_audio:
@@ -1331,11 +1320,8 @@ class EchoApp(App[None]):
         t1w: float,
         text: str,
         allow_correction: bool,
-        pretyped: bool = False,
         split_groups: bool = True,
     ) -> None:
-        from echo.asr import format_timestamp_hms
-
         payload = _normalize_spaces(text)
         if not payload:
             return
@@ -1349,70 +1335,27 @@ class EchoApp(App[None]):
 
         ts = f"[{format_timestamp_hms(t0w)}–{format_timestamp_hms(t1w)}]"
         for i, g in enumerate(groups):
-            await self._typewriter_emit_line(
+            await self._emit_live_group_line(
                 log,
                 ts,
                 g,
                 allow_correction=allow_correction,
-                pretyped=pretyped,
             )
             if i < len(groups) - 1 and self.live_group_delay > 0:
                 await asyncio.sleep(self.live_group_delay)
 
-    async def _typewriter_preview_append(self, ts: str, text: str) -> None:
-        if not self.live_audio:
-            return
-        incoming = _normalize_spaces(text)
-        if not incoming:
-            return
-        current = self._live_preview_text
-        if not current.startswith(f"{ts} "):
-            current = f"{ts} "
-        if self.live_char_delay <= 0:
-            self._live_preview_text = current + incoming
-            self._tick_live_preview()
-            return
-        for ch in incoming:
-            current += ch
-            self._live_preview_text = current
-            self._tick_live_preview()
-            await asyncio.sleep(self.live_char_delay)
-
-    async def _typewriter_emit_line(
+    async def _emit_live_group_line(
         self,
         log: RichLog,
         ts: str,
         text: str,
         *,
         allow_correction: bool,
-        pretyped: bool = False,
     ) -> None:
-        line = f"{ts} {text}"
-        if pretyped or not self.live_audio or self.live_char_delay <= 0:
-            self._live_preview_text = ""
-            self._tick_live_preview()
-            await self._emit_transcript_line(
-                log,
-                line,
-                spoken_text=text,
-                allow_correction=allow_correction,
-                stable_delay=self.live_rewrite_stable_seconds if self.live_audio else 0.0,
-            )
-            return
-
-        typed = ""
-        for ch in text:
-            typed += ch
-            self._live_preview_text = f"{ts} {typed}"
-            self._tick_live_preview()
-            await asyncio.sleep(self.live_char_delay)
-
-        self._live_preview_text = ""
-        self._tick_live_preview()
-        # First flush (local ASR) completes here; only then enqueue for LLM insight passes.
+        """Emit one finalized live transcript line. Used by the legacy interval batch flush path."""
         await self._emit_transcript_line(
             log,
-            line,
+            f"{ts} {text}",
             spoken_text=text,
             allow_correction=allow_correction,
             stable_delay=self.live_rewrite_stable_seconds if self.live_audio else 0.0,
@@ -1443,7 +1386,7 @@ class EchoApp(App[None]):
         await self._transcript_queue.put(self._eof_sentinel)
 
     async def _transcription_from_audio(self, log: RichLog) -> None:
-        from echo.asr import TranscribeSession, format_timestamp_hms
+        from echo.asr import TranscribeSession
 
         path = self.audio_path
         if path is None or not path.is_file():
@@ -1500,576 +1443,11 @@ class EchoApp(App[None]):
             )
 
     async def _transcription_from_live(self, log: RichLog) -> None:
-        import numpy as np
-        from echo.asr import format_timestamp_hms, transcribe_mono16k_chunk
-        from echo.live_audio import (
-            LiveMixerConfig,
-            LivePairedCapture,
-            LiveSystemAuthorizedCapture,
-            LiveSystemAuthorizedConfig,
-        )
+        """Run one live ASR session. The loop and its state live in ``LiveTranscriptionSession``."""
+        from echo.live_session import LiveTranscriptionSession
 
-        self._log_transcript_meta(
-            log,
-            (
-                f"[dim]Live ASR (`{self.model_id}`) — local Hub cache only, no download.[/]"
-                if hub_local_only_from_env()
-                else f"[dim]Live ASR (`{self.model_id}`) — model already loaded on the main thread.[/]"
-            ),
-            debug_only=True,
-        )
-        self._log_transcript_meta(
-            log,
-            f"[dim]ASR model load source: {_render_asr_load_source_label(self.asr_load_source)}.[/]",
-            debug_only=True,
-        )
-
-        if self.live_system_authorized:
-            from echo.live_audio import ensure_macos_system_audio_helper
-
-            cmd = self.live_system_authorized_cmd or os.environ.get("ECHO_SYSTEM_AUDIO_CMD")
-            if not cmd:
-                try:
-                    cmd = await asyncio.to_thread(ensure_macos_system_audio_helper)
-                except Exception as e:  # noqa: BLE001
-                    self._log_transcript_meta(
-                        log,
-                        "[red]Failed to build bundled macOS system-audio helper:[/] "
-                        f"{e!s}\n"
-                        "[dim]You can still provide an explicit command via "
-                        "--live-system-authorized-cmd '/path/to/cmd'.[/]",
-                    )
-                    return
-            self._log_transcript_meta(
-                log,
-                "[dim]Live: microphone + system output via authorized macOS capture command "
-                "(System Audio Recording Only on macOS 14.2+, otherwise Screen Recording; "
-                "Microphone permission may also be requested). "
-                "Transcript appends continuously and creates a new segment only after a long pause.[/]",
-                debug_only=True,
-            )
-        elif self.live_system_device is None:
-            self._log_transcript_meta(
-                log,
-                "[dim]Live: microphone only. Add --live-system-device (e.g. BlackHole 2ch index) "
-                "to mix system audio, or create an aggregate input in Audio MIDI Setup. "
-                "Transcript appends continuously and creates a new segment only after a long pause.[/]",
-                debug_only=True,
-            )
-        else:
-            self._log_transcript_meta(
-                log,
-                "[dim]Live: microphone + second input (50/50 mono mix). "
-                "p = pause (discards audio while paused). "
-                "Transcript appends continuously and creates a new segment only after a long pause.[/]",
-                debug_only=True,
-            )
-
-        system_cap: LiveSystemAuthorizedCapture | None = None
-        if self.live_system_authorized:
-            system_cap = LiveSystemAuthorizedCapture(
-                LiveSystemAuthorizedConfig(
-                    mic_device=self.live_mic_device,
-                    command=cmd,
-                    samplerate=16000,
-                    blocksize=2048,
-                )
-            )
-            cap = system_cap
-            try:
-                cap.start()
-            except Exception as e:  # noqa: BLE001
-                self._log_transcript_meta(
-                    log,
-                    "[red]Failed to start system-authorized capture:[/] "
-                    f"{e!s}\n"
-                    "[dim]Tip: install/build SystemAudioDump and pass "
-                    "--live-system-authorized-cmd '/path/to/SystemAudioDump'.[/]",
-                )
-                return
-        else:
-            cfg = LiveMixerConfig(
-                mic_device=self.live_mic_device,
-                system_device=self.live_system_device,
-                samplerate=16000,
-                blocksize=2048,
-            )
-            cap = LivePairedCapture(cfg)
-            cap.start()
-        sr = 16000
-        chunk_samples = max(int(self.chunk_seconds * sr), int(0.5 * sr))
-        overlap_samples = max(0, int(self.live_chunk_overlap_seconds * sr))
-        if overlap_samples >= chunk_samples:
-            overlap_samples = max(0, chunk_samples // 2)
-        hop_samples = max(1, chunk_samples - overlap_samples)
-        buf = np.array([], dtype=np.float32)
-        self._live_wall_t0 = time.monotonic()
-        lang = self.live_asr_language
-        self._live_meter_note = "Listening"
-        last_chunk_text = ""
-        pending_texts: list[str] = []
-        pending_t0w: float | None = None
-        pending_t1w: float | None = None
-        pending_allow_correction = True
-        pending_pretyped = False
-        last_voiced_wall = 0.0
-        live_draft_segment: TranscriptSegment | None = None
-        live_draft_t0w: float | None = None
-        live_draft_allow_correction = True
-        live_draft_stable_after = 0.0
-        live_draft_last_snapshot_text = ""
-        live_draft_last_snapshot_at = 0.0
-
-        def _clear_pending() -> None:
-            nonlocal pending_texts, pending_t0w, pending_t1w, pending_allow_correction, pending_pretyped
-            pending_texts = []
-            pending_t0w = None
-            pending_t1w = None
-            pending_allow_correction = True
-            pending_pretyped = False
-
-        async def _append_live_draft(
-            *,
-            t0w: float,
-            t1w: float,
-            text: str,
-            allow_correction: bool,
-        ) -> None:
-            nonlocal live_draft_segment, live_draft_t0w, live_draft_allow_correction, live_draft_stable_after
-            nonlocal live_draft_last_snapshot_text, live_draft_last_snapshot_at
-            payload = _normalize_spaces(text)
-            if not payload:
-                return
-            if live_draft_segment is None or live_draft_t0w is None:
-                line = f"[{format_timestamp_hms(t0w)}–{format_timestamp_hms(t1w)}] {payload}"
-                live_draft_segment = await self._emit_transcript_line(
-                    log,
-                    line,
-                    spoken_text=payload,
-                    allow_correction=allow_correction,
-                    stable_delay=self.live_rewrite_stable_seconds if self.live_audio else 0.0,
-                    enqueue=False,
-                    finalized=False,
-                )
-                live_draft_t0w = t0w
-                live_draft_allow_correction = allow_correction
-                live_draft_stable_after = live_draft_segment.stable_after
-                live_draft_last_snapshot_text = payload
-                live_draft_last_snapshot_at = time.monotonic()
-                await self._transcript_queue.put(
-                    TranscriptSegment(
-                        line_id=live_draft_segment.line_id,
-                        line=line,
-                        spoken_text=payload,
-                        stable_after=live_draft_stable_after,
-                        allow_correction=allow_correction,
-                        finalized=False,
-                    )
-                )
-                return
-
-            seg_id = live_draft_segment.line_id
-            idx = self._line_id_to_index.get(seg_id)
-            if idx is None or idx < 0 or idx >= len(self._lines):
-                # Fallback: if a draft line was externally reset, start a new draft line.
-                line = f"[{format_timestamp_hms(t0w)}–{format_timestamp_hms(t1w)}] {payload}"
-                live_draft_segment = await self._emit_transcript_line(
-                    log,
-                    line,
-                    spoken_text=payload,
-                    allow_correction=allow_correction,
-                    stable_delay=self.live_rewrite_stable_seconds if self.live_audio else 0.0,
-                    enqueue=False,
-                    finalized=False,
-                )
-                live_draft_t0w = t0w
-                live_draft_allow_correction = allow_correction
-                live_draft_stable_after = live_draft_segment.stable_after
-                live_draft_last_snapshot_text = payload
-                live_draft_last_snapshot_at = time.monotonic()
-                await self._transcript_queue.put(
-                    TranscriptSegment(
-                        line_id=live_draft_segment.line_id,
-                        line=line,
-                        spoken_text=payload,
-                        stable_after=live_draft_stable_after,
-                        allow_correction=allow_correction,
-                        finalized=False,
-                    )
-                )
-                return
-
-            prev_spoken = self._line_id_to_spoken.get(seg_id, live_draft_segment.spoken_text)
-            merged = _normalize_spaces(f"{prev_spoken} {payload}")
-            line = f"[{format_timestamp_hms(live_draft_t0w)}–{format_timestamp_hms(t1w)}] {merged}"
-            self._lines[idx] = line
-            self._line_id_to_spoken[seg_id] = merged
-            live_draft_allow_correction = live_draft_allow_correction and allow_correction
-            live_draft_segment.line = line
-            live_draft_segment.spoken_text = merged
-            live_draft_segment.allow_correction = live_draft_allow_correction
-            live_draft_segment.stable_after = live_draft_stable_after
-            live_draft_segment.finalized = False
-            await self._refresh_transcript_log()
-            now = time.monotonic()
-            should_snapshot = (
-                merged != live_draft_last_snapshot_text
-                and (now - live_draft_last_snapshot_at) >= self.insight_pause_seconds
-            )
-            if should_snapshot:
-                live_draft_last_snapshot_text = merged
-                live_draft_last_snapshot_at = now
-                await self._transcript_queue.put(
-                    TranscriptSegment(
-                        line_id=live_draft_segment.line_id,
-                        line=line,
-                        spoken_text=merged,
-                        stable_after=live_draft_stable_after,
-                        allow_correction=live_draft_allow_correction,
-                        finalized=False,
-                    )
-                )
-
-        async def _finalize_live_draft(reason: str) -> bool:
-            nonlocal live_draft_segment, live_draft_t0w, live_draft_allow_correction, live_draft_stable_after
-            nonlocal live_draft_last_snapshot_text, live_draft_last_snapshot_at
-            if live_draft_segment is None:
-                return False
-            spoken = self._line_id_to_spoken.get(live_draft_segment.line_id, live_draft_segment.spoken_text).strip()
-            if not spoken:
-                live_draft_segment = None
-                live_draft_t0w = None
-                live_draft_allow_correction = True
-                live_draft_stable_after = 0.0
-                return False
-            if spoken == self._last_live_emitted_spoken:
-                self._debug_note("pause flush dropped identical segment")
-                live_draft_segment = None
-                live_draft_t0w = None
-                live_draft_allow_correction = True
-                live_draft_stable_after = 0.0
-                live_draft_last_snapshot_text = ""
-                live_draft_last_snapshot_at = 0.0
-                return False
-            live_draft_segment.spoken_text = spoken
-            live_draft_segment.allow_correction = live_draft_allow_correction
-            live_draft_segment.stable_after = live_draft_stable_after
-            live_draft_segment.finalized = True
-            await self._transcript_queue.put(live_draft_segment)
-            self._last_live_emitted_spoken = spoken
-            self._debug_note(
-                f"flush local reason={reason} chars={len(spoken)} allow_fix={live_draft_allow_correction}",
-            )
-            live_draft_segment = None
-            live_draft_t0w = None
-            live_draft_allow_correction = True
-            live_draft_stable_after = 0.0
-            live_draft_last_snapshot_text = ""
-            live_draft_last_snapshot_at = 0.0
-            return True
-
-        def _draft_finalize_reason(*, reason: str, idle_for: float) -> str:
-            if live_draft_segment is None:
-                return ""
-            spoken = self._line_id_to_spoken.get(live_draft_segment.line_id, live_draft_segment.spoken_text).strip()
-            if not spoken:
-                return ""
-            if reason in ("pause", "paused", "capture_stopped", "stop"):
-                return reason
-            if idle_for >= self.live_segment_pause_seconds:
-                return "pause"
-
-            over_limit = False
-            if len(spoken) >= self.ui_segment_max_chars:
-                over_limit = True
-            else:
-                span = _line_span_seconds(live_draft_segment.line)
-                if span is not None:
-                    t0, t1 = span
-                    if max(0.0, t1 - t0) >= self.ui_segment_max_seconds:
-                        over_limit = True
-
-            ends_at_sentence = _LIVE_SENTENCE_END_RE.search(spoken)
-
-            # Over length/time limit: prefer cutting at a sentence boundary,
-            # but if ASR output has no punctuation, cut immediately — the
-            # segment is already long enough.
-            if over_limit:
-                if ends_at_sentence:
-                    return "max_sentence"
-                if _LIVE_SENTENCE_END_ANYWHERE_RE.search(spoken):
-                    return "max_mid_sentence"
-                return "max_no_punct"
-
-            # Normal sentence-end: need a brief pause to avoid cutting
-            # between back-to-back sentences in continuous speech.
-            if (
-                ends_at_sentence
-                and len(spoken) >= self.ui_segment_semantic_min_chars
-                and idle_for >= min(self.live_segment_pause_seconds, 0.6)
-            ):
-                return "sentence_end"
-            return ""
-
-        async def _flush_pending(reason: str) -> None:
-            if not pending_texts or pending_t0w is None or pending_t1w is None:
-                idle_for = (time.monotonic() - last_voiced_wall) if last_voiced_wall > 0 else 0.0
-                fin_reason = _draft_finalize_reason(reason=reason, idle_for=idle_for)
-                if fin_reason:
-                    emitted = await _finalize_live_draft(fin_reason)
-                    if emitted and fin_reason in ("stop", "capture_stopped", "paused"):
-                        self._force_live_insight_flush = True
-                return
-            joined = _normalize_spaces(" ".join(pending_texts))
-            if not joined:
-                _clear_pending()
-                return
-            if self.live_emit_interval <= 0.0:
-                await _append_live_draft(
-                    t0w=pending_t0w,
-                    t1w=pending_t1w,
-                    text=joined,
-                    allow_correction=pending_allow_correction,
-                )
-                _clear_pending()
-                idle_for = (time.monotonic() - last_voiced_wall) if last_voiced_wall > 0 else 0.0
-                fin_reason = _draft_finalize_reason(reason=reason, idle_for=idle_for)
-                if fin_reason:
-                    emitted = await _finalize_live_draft(fin_reason)
-                    if emitted and fin_reason in ("stop", "capture_stopped", "paused"):
-                        self._force_live_insight_flush = True
-                return
-            if reason in ("pause", "paused", "capture_stopped", "stop"):
-                await _append_live_draft(
-                    t0w=pending_t0w,
-                    t1w=pending_t1w,
-                    text=joined,
-                    allow_correction=pending_allow_correction,
-                )
-                _clear_pending()
-                idle_for = (time.monotonic() - last_voiced_wall) if last_voiced_wall > 0 else 0.0
-                fin_reason = _draft_finalize_reason(reason=reason, idle_for=idle_for)
-                if fin_reason:
-                    emitted = await _finalize_live_draft(fin_reason)
-                    if emitted:
-                        self._force_live_insight_flush = True
-                return
-            if joined == self._last_live_emitted_spoken:
-                self._debug_note("pause flush dropped identical segment")
-            else:
-                await self._flush_live_group(
-                    log,
-                    t0w=pending_t0w,
-                    t1w=pending_t1w,
-                    text=joined,
-                    allow_correction=pending_allow_correction,
-                    pretyped=pending_pretyped,
-                    split_groups=False,
-                )
-                self._last_live_emitted_spoken = joined
-                self._debug_note(
-                    f"flush local reason={reason} chars={len(joined)} allow_fix={pending_allow_correction}",
-                )
-            _clear_pending()
-
-        async def _flush_if_needed(*, idle_tick: bool) -> None:
-            nonlocal pending_t0w, pending_t1w
-            idle_for = (time.monotonic() - last_voiced_wall) if last_voiced_wall > 0 else 0.0
-            if not pending_texts:
-                if (
-                    idle_tick
-                    and self.live_emit_interval <= 0.0
-                    and live_draft_segment is not None
-                ):
-                    fin_reason = _draft_finalize_reason(reason="", idle_for=idle_for)
-                    if fin_reason:
-                        await _flush_pending(fin_reason)
-                return
-            pending_duration = 0.0
-            if pending_t0w is not None and pending_t1w is not None:
-                pending_duration = max(0.0, pending_t1w - pending_t0w)
-            should_flush, reason = _should_flush_live_pending(
-                has_pending=bool(pending_texts),
-                pending_duration=pending_duration,
-                idle_tick=idle_tick,
-                idle_for=idle_for,
-                pause_seconds=self.live_segment_pause_seconds,
-                emit_interval=self.live_emit_interval,
-            )
-            if should_flush:
-                await _flush_pending(reason)
-
-        try:
-            pause_drain_done = False
-            reset_seq = self._live_reset_seq
-            while True:
-                while self._paused:
-                    if not pause_drain_done:
-                        await _flush_pending("paused")
-                        pause_drain_done = True
-                    await asyncio.sleep(0.05)
-                if self._live_reset_seq != reset_seq:
-                    reset_seq = self._live_reset_seq
-                    _clear_pending()
-                    live_draft_segment = None
-                    live_draft_t0w = None
-                    live_draft_allow_correction = True
-                    live_draft_stable_after = 0.0
-                    live_draft_last_snapshot_text = ""
-                    live_draft_last_snapshot_at = 0.0
-                    last_chunk_text = ""
-                    last_voiced_wall = 0.0
-                    buf = np.array([], dtype=np.float32)
-                    self._live_wall_t0 = time.monotonic()
-                    self._last_live_emitted_spoken = ""
-                    while not cap.out_q.empty():
-                        try:
-                            cap.out_q.get_nowait()
-                        except Exception:  # noqa: BLE001
-                            break
-                    self._debug_note("live worker state reset")
-                pause_drain_done = False
-
-                block = await asyncio.to_thread(cap.read_block, 0.35)
-                if block is None:
-                    if system_cap is not None and system_cap.process_exited():
-                        msg = system_cap.process_error_text()
-                        await _flush_pending("capture_stopped")
-                        self._log_transcript_meta(
-                            log,
-                            "[red]System-authorized capture stopped:[/] "
-                            f"{msg or 'unknown helper failure'}",
-                        )
-                        self._live_meter_note = "Capture stopped"
-                        self._debug_note(f"capture stopped: {msg or 'unknown helper failure'}")
-                        self._live_preview_text = ""
-                        self._tick_live_preview()
-                        return
-                    await _flush_if_needed(idle_tick=True)
-                    await asyncio.sleep(0.02)
-                    continue
-                arr = np.asarray(block, dtype=np.float32).reshape(-1)
-                if arr.size == 0:
-                    await _flush_if_needed(idle_tick=True)
-                    await asyncio.sleep(0.02)
-                    continue
-                block_rms = float(np.sqrt(np.mean(np.square(arr), dtype=np.float64)))
-                block_peak = float(np.max(np.abs(arr)))
-                self._live_meter_rms = (self._live_meter_rms * 0.75) + (block_rms * 0.25)
-                self._live_meter_peak = max(block_peak, self._live_meter_peak * 0.88)
-                if block_peak > 1e-4:
-                    self._live_meter_last_signal_at = time.monotonic()
-                    if not self._paused:
-                        self._live_meter_note = "Signal detected"
-                buf = np.concatenate([buf, arr])
-
-                while buf.size >= chunk_samples:
-                    piece = buf[:chunk_samples]
-                    buf = buf[hop_samples:]
-                    t0w = time.monotonic() - (self._live_wall_t0 or time.monotonic())
-                    t1w = t0w + (chunk_samples / sr)
-                    piece_rms, piece_peak, piece_active_ratio = _live_chunk_metrics(
-                        piece,
-                        active_amp=self.live_active_amp,
-                    )
-                    if not _passes_live_voice_gate(
-                        rms=piece_rms,
-                        peak=piece_peak,
-                        active_ratio=piece_active_ratio,
-                        min_rms=self.live_min_rms,
-                        active_amp=self.live_active_amp,
-                        min_active_ratio=self.live_min_active_ratio,
-                    ):
-                        if not self._paused:
-                            self._live_meter_note = "Silence gate"
-                            now_dbg = time.monotonic()
-                            if now_dbg - self._last_silence_debug_at >= 1.8:
-                                self._debug_note(
-                                    f"gate silence rms={piece_rms:.4f} peak={piece_peak:.4f} active={piece_active_ratio:.3f}",
-                                )
-                                self._last_silence_debug_at = now_dbg
-                        await _flush_if_needed(idle_tick=True)
-                        continue
-                    try:
-                        asr_t0 = time.monotonic()
-                        text = await asyncio.to_thread(
-                            transcribe_mono16k_chunk,
-                            piece,
-                            model_id=self.model_id,
-                            device=self.whisper_device,
-                            language=self.live_asr_language or lang,
-                        )
-                        asr_t1 = time.monotonic()
-                    except Exception as e:  # noqa: BLE001
-                        self._log_transcript_meta(log, f"[red]Live chunk failed:[/] {e!s}")
-                        self._live_meter_note = "ASR error"
-                        self._debug_note(f"asr chunk error: {e!s}")
-                        continue
-                    chunk_secs = max(1e-6, (chunk_samples / sr))
-                    decode_secs = max(0.0, asr_t1 - asr_t0)
-                    rtf = decode_secs / chunk_secs
-                    live_now = time.monotonic() - (self._live_wall_t0 or time.monotonic())
-                    lag_secs = max(0.0, live_now - t1w)
-                    e2e_delay_secs = max(0.0, live_now - t0w)
-                    if self.live_asr_log_interval_seconds > 0.0:
-                        if (time.monotonic() - self._last_asr_latency_debug_at) >= self.live_asr_log_interval_seconds:
-                            self._debug_note(
-                                "asr latency "
-                                f"decode={decode_secs*1000:.0f}ms chunk={chunk_secs:.2f}s "
-                                f"rtf={rtf:.2f} lag={lag_secs:.2f}s e2e_delay={e2e_delay_secs:.2f}s",
-                            )
-                            self._last_asr_latency_debug_at = time.monotonic()
-                    if not (text or "").strip():
-                        continue
-                    cleaned = _normalize_spaces(text)
-                    if not cleaned:
-                        continue
-                    deduped = _trim_chunk_overlap(
-                        last_chunk_text,
-                        cleaned,
-                        min_chars=self.live_overlap_min_chars,
-                    )
-                    last_chunk_text = cleaned
-                    if not deduped:
-                        self._debug_note("dedup dropped fully-overlapped chunk")
-                        continue
-                    if _should_drop_live_noise_token(
-                        text=deduped,
-                        noise_tokens=self.live_noise_tokens,
-                        always_drop_tokens=self.live_always_drop_noise_tokens,
-                        max_chars=self.live_noise_max_chars,
-                        piece_rms=piece_rms,
-                        min_rms=self.live_min_rms,
-                        max_rms_factor=self.live_noise_max_rms_factor,
-                        is_segment_start=(live_draft_segment is None and not pending_texts),
-                        drop_at_segment_start=self.live_noise_drop_at_segment_start,
-                    ):
-                        self._debug_note(
-                            f"noise token dropped text={deduped!r} rms={piece_rms:.4f} "
-                            f"segment_start={live_draft_segment is None and not pending_texts}",
-                        )
-                        continue
-
-                    allow_piece_correction = piece_rms >= (self.live_min_rms * 1.25) or (
-                        piece_active_ratio >= (self.live_min_active_ratio * 2.0)
-                    )
-                    if pending_t0w is None:
-                        pending_t0w = t0w
-                    pending_t1w = t1w
-                    preview_ts = f"[{format_timestamp_hms(pending_t0w)}–{format_timestamp_hms(pending_t1w)}]"
-                    await self._typewriter_preview_append(preview_ts, deduped)
-                    pending_pretyped = True
-                    pending_texts.append(deduped)
-                    pending_allow_correction = pending_allow_correction and allow_piece_correction
-                    last_voiced_wall = time.monotonic()
-                    await _flush_if_needed(idle_tick=False)
-        finally:
-            await _flush_pending("stop")
-            self._live_meter_note = "Stopped"
-            self._debug_note("live transcription stopped")
-            self._live_preview_text = ""
-            self._tick_live_preview()
-            cap.stop()
+        session = LiveTranscriptionSession(self, log)
+        await session.run()
 
     async def _insight_worker(self) -> None:
         while True:
@@ -2078,12 +1456,15 @@ class EchoApp(App[None]):
             except asyncio.TimeoutError:
                 chunk = None
             if chunk == self._eof_sentinel:
-                source_segments = list(self._insight_buffer)
+                source_segments = [self._insight_seg_by_id[i] for i in self._insight_seg_order]
                 buf_text = "\n".join(seg.spoken_text for seg in source_segments).strip()
-                self._insight_buffer.clear()
+                self._insight_seg_by_id.clear()
+                self._insight_seg_order.clear()
                 self._insight_line_state.clear()
                 if buf_text and not self._llm_offline:
-                    await self._run_insight_pass(buf_text, source_segments)
+                    await self._run_insight_pass(
+                        buf_text, source_segments, session_id=self._insight_session_id,
+                    )
                 break
             if isinstance(chunk, TranscriptSegment) and not self._llm_offline:
                 norm_spoken = _normalize_spaces(chunk.spoken_text)
@@ -2091,41 +1472,33 @@ class EchoApp(App[None]):
                 if self._insight_line_state.get(chunk.line_id) == state:
                     continue
                 self._insight_line_state[chunk.line_id] = state
-                replaced = False
-                for i, seg in enumerate(self._insight_buffer):
-                    if seg.line_id == chunk.line_id:
-                        self._insight_buffer[i] = chunk
-                        replaced = True
-                        break
-                if not replaced:
-                    self._insight_buffer.append(chunk)
+                lid = chunk.line_id
+                if lid in self._insight_seg_by_id:
+                    self._insight_seg_by_id[lid] = chunk
+                else:
+                    self._insight_seg_by_id[lid] = chunk
+                    self._insight_seg_order.append(lid)
                 self._last_transcript_activity_at = time.monotonic()
-            if self._paused and not self._force_live_insight_flush:
-                # Pause usually freezes new insight generation; forced terminal flush still goes through.
+            if self.live_audio and self._paused and not self._force_live_insight_flush:
+                # Live only: pause freezes new insight generation; forced terminal flush still goes through.
                 continue
             now = time.monotonic()
             if self.live_audio:
                 if self._force_live_insight_flush:
-                    eligible = list(self._insight_buffer)
+                    eligible = [self._insight_seg_by_id[i] for i in self._insight_seg_order]
                 else:
-                    eligible = [seg for seg in self._insight_buffer if seg.finalized]
+                    eligible = [
+                        self._insight_seg_by_id[i]
+                        for i in self._insight_seg_order
+                        if self._insight_seg_by_id[i].finalized
+                    ]
             else:
-                eligible = [seg for seg in self._insight_buffer if seg.stable_after <= now]
+                eligible = [
+                    self._insight_seg_by_id[i]
+                    for i in self._insight_seg_order
+                    if self._insight_seg_by_id[i].stable_after <= now
+                ]
             buf_text = "\n".join(seg.spoken_text for seg in eligible).strip()
-            span_start: float | None = None
-            span_end: float | None = None
-            for seg in eligible:
-                span = _line_span_seconds(seg.line)
-                if span is None:
-                    continue
-                t0, t1 = span
-                span_start = t0 if span_start is None else min(span_start, t0)
-                span_end = t1 if span_end is None else max(span_end, t1)
-            new_seconds = (
-                max(0.0, span_end - span_start)
-                if span_start is not None and span_end is not None
-                else 0.0
-            )
             new_finalized_segments = sum(1 for seg in eligible if seg.finalized)
             max_finalized_segment_chars = max(
                 (len(seg.spoken_text) for seg in eligible if seg.finalized),
@@ -2136,21 +1509,17 @@ class EchoApp(App[None]):
                 force_final = self._force_live_insight_flush
                 should_run, trigger_reason = _should_trigger_insight_live(
                     new_chars=len(buf_text),
-                    new_seconds=new_seconds,
                     new_finalized_segments=new_finalized_segments,
                     max_finalized_segment_chars=max_finalized_segment_chars,
-                    idle_tick=(chunk is None),
-                    idle_for=now - self._last_transcript_activity_at,
-                    min_chars=self.insight_min_chars,
-                    min_seconds=self.insight_live_min_seconds,
-                    pause_min_chars=self.insight_pause_min_chars,
                     finalized_segment_min_chars=self.insight_finalized_segment_min_chars,
                     skip_min_chars=self.insight_skip_min_chars,
-                    pause_seconds=self.insight_pause_seconds,
                 )
                 if force_final and buf_text:
                     should_run = True
                     trigger_reason = "forced_final"
+                elif force_final and not buf_text:
+                    # Avoid wedging the worker when nothing remains to flush (e.g. post-drain arm).
+                    self._force_live_insight_flush = False
                 elif should_run and (now - self._last_insight_at) < self.insight_live_min_interval:
                     should_run = False
                     trigger_reason = "min_interval"
@@ -2159,7 +1528,7 @@ class EchoApp(App[None]):
                         self._debug_note(
                             "insight skipped "
                             f"reason=min_interval wait={wait_for:.1f}s chars={len(buf_text)} "
-                            f"finalized={new_finalized_segments} duration={new_seconds:.1f}s",
+                            f"finalized={new_finalized_segments}",
                         )
                         self._last_min_interval_debug_at = now
             else:
@@ -2180,6 +1549,21 @@ class EchoApp(App[None]):
                 self._debug_note("insight skipped reason=busy")
                 continue
 
+            if (
+                self.live_audio
+                and not self._force_live_insight_flush
+                and self.insight_pause_capture_q > 0
+                and self._live_capture_queue_depth >= self.insight_pause_capture_q
+            ):
+                if now - self._last_capture_backlog_debug_at >= 1.0:
+                    self._debug_note(
+                        "insight skipped "
+                        f"reason=capture_backlog cap_q={self._live_capture_queue_depth}"
+                        f">={self.insight_pause_capture_q}",
+                    )
+                    self._last_capture_backlog_debug_at = now
+                continue
+
             snapshot = buf_text
             source_segments = list(eligible)
             if self.live_audio and not self._force_live_insight_flush:
@@ -2191,95 +1575,160 @@ class EchoApp(App[None]):
                     self._debug_note("insight skipped reason=no_new_content_since_last_comment")
                     continue
             sig = _insight_segments_signature(source_segments)
-            if sig == self._last_insight_submission_sig:
+            if self.live_audio and sig == self._last_insight_submission_sig:
                 self._debug_note("insight skipped reason=duplicate_input")
                 continue
             consumed = {seg.line_id for seg in source_segments}
-            self._insight_buffer = [seg for seg in self._insight_buffer if seg.line_id not in consumed]
             for sid in consumed:
+                self._insight_seg_by_id.pop(sid, None)
                 self._insight_line_state.pop(sid, None)
+            self._insight_seg_order = [i for i in self._insight_seg_order if i not in consumed]
             self._debug_note(
                 "insight trigger "
                 f"reason={trigger_reason or '-'} chars={len(snapshot)} "
-                f"segments={len(source_segments)} buffered_left={len(self._insight_buffer)}",
+                f"segments={len(source_segments)} buffered_left={len(self._insight_seg_order)}",
             )
             self._last_insight_at = now
             self._last_insight_submission_sig = sig
             if trigger_reason == "forced_final":
                 self._force_live_insight_flush = False
-            asyncio.create_task(self._run_insight_pass(snapshot, source_segments))
+            task = asyncio.create_task(
+                self._run_insight_pass(snapshot, source_segments, session_id=self._insight_session_id)
+            )
+            self._insight_tasks.add(task)
+            task.add_done_callback(self._insight_tasks.discard)
 
     async def _refresh_insights_panel(self, *, tail: str | None = None) -> None:
+        """Render the insights panel.
+
+        The naive implementation cleared every child and re-mounted them on every refresh,
+        which scaled O(N) widgets per insight pass (each pass adds 1–4 widgets and we get
+        2–3 refreshes per pass: ``Generating…`` → success → completion). That meant a
+        meeting with 30 passes paid ~120× the cost of just appending the new pass.
+
+        This version keeps a generation counter (``_rendered_pass_count``) and a handle
+        to the trailing ``tail`` widget set, then incrementally mounts only the new
+        passes plus a fresh tail. It falls back to a full rebuild if the counter is
+        out of sync (e.g. after ``action_reset`` clears ``_insight_passes``).
+        """
         scroll = self.query_one("#insights", VerticalScroll)
 
         def _scroll_bottom() -> None:
             try:
                 scroll.scroll_end(animate=False)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 # Keep rendering robust across Textual version differences.
                 return
 
+        rendered = getattr(self, "_rendered_pass_count", 0)
+        passes = self._insight_passes
+        # We can take the incremental path only when:
+        #   - the panel is already showing the same prefix of passes (count only grew), and
+        #   - we have a header in place (i.e. a non-empty render exists).
+        can_incremental = (
+            rendered > 0
+            and rendered <= len(passes)
+            and getattr(self, "_insight_header_mounted", False)
+        )
+
+        if not can_incremental:
+            await self._rebuild_insights_panel_full(scroll, tail)
+            _scroll_bottom()
+            return
+
+        await self._remove_insight_tail_widgets()
+        for i in range(rendered, len(passes)):
+            await self._mount_insight_pass(scroll, passes[i], with_leading_rule=(i > 0))
+        self._rendered_pass_count = len(passes)
+        await self._mount_insight_tail(scroll, tail)
+        _scroll_bottom()
+
+    async def _rebuild_insights_panel_full(
+        self, scroll: VerticalScroll, tail: str | None,
+    ) -> None:
         for child in list(scroll.children):
             await child.remove()
-        if not self._insight_passes:
+        self._rendered_pass_count = 0
+        self._insight_header_mounted = False
+        self._insight_tail_widgets = []
+
+        passes = self._insight_passes
+        if not passes:
             if tail is None:
                 md = (
                     _llm_unavailable_insights_markdown()
                     if self._llm_offline
                     else _initial_insights_markdown()
                 )
-                await scroll.mount(Markdown(md))
+                placeholder = Markdown(md)
             else:
-                await scroll.mount(Markdown(f"## Insights\n\n{tail}\n"))
-            _scroll_bottom()
+                placeholder = Markdown(f"## Insights\n\n{tail}\n")
+            await scroll.mount(placeholder)
+            # Treat the placeholder as a tail-equivalent so the next refresh can swap it cleanly.
+            self._insight_tail_widgets = [placeholder]
             return
-        await scroll.mount(Markdown("## Insights"))
-        await scroll.mount(Rule())
-        for i, rec in enumerate(self._insight_passes):
-            if i:
-                await scroll.mount(Rule())
-            heading = "Comment" if rec.kind == "comment" else "Research summary"
-            await scroll.mount(
-                Markdown(
-                    f"### Pass {rec.n} @ `{rec.stamp}`\n\n"
-                    f"## {heading}\n\n{rec.body_md}\n",
-                ),
-            )
-            if self.debug_enabled and rec.routing_md:
-                await scroll.mount(
-                    Collapsible(
-                        Markdown(rec.routing_md),
-                        title="Routing",
-                        collapsed=True,
-                    ),
-                )
-            if self.debug_enabled and rec.corrected_md:
-                await scroll.mount(
-                    Collapsible(
-                        Markdown(rec.corrected_md),
-                        title="Cleaned segment",
-                        collapsed=True,
-                    ),
-                )
-            if rec.web_md:
-                await scroll.mount(
-                    Collapsible(
-                        Markdown(rec.web_md),
-                        title="Web search",
-                        collapsed=True,
-                    ),
-                )
-        if tail:
+
+        header = Markdown("## Insights")
+        header_rule = Rule()
+        await scroll.mount(header)
+        await scroll.mount(header_rule)
+        self._insight_header_mounted = True
+        for i, rec in enumerate(passes):
+            await self._mount_insight_pass(scroll, rec, with_leading_rule=(i > 0))
+        self._rendered_pass_count = len(passes)
+        await self._mount_insight_tail(scroll, tail)
+
+    async def _mount_insight_pass(
+        self, scroll: VerticalScroll, rec: "InsightPassRecord", *, with_leading_rule: bool,
+    ) -> None:
+        if with_leading_rule:
             await scroll.mount(Rule())
-            await scroll.mount(Markdown(tail))
-        _scroll_bottom()
+        heading = "Comment" if rec.kind == "comment" else "Research summary"
+        await scroll.mount(
+            Markdown(
+                f"### Pass {rec.n} @ `{rec.stamp}`\n\n"
+                f"## {heading}\n\n{rec.body_md}\n",
+            ),
+        )
+        if self.debug_enabled and rec.routing_md:
+            await scroll.mount(
+                Collapsible(Markdown(rec.routing_md), title="Routing", collapsed=True),
+            )
+        if self.debug_enabled and rec.corrected_md:
+            await scroll.mount(
+                Collapsible(Markdown(rec.corrected_md), title="Cleaned segment", collapsed=True),
+            )
+        if rec.web_md:
+            await scroll.mount(
+                Collapsible(Markdown(rec.web_md), title="Web search", collapsed=True),
+            )
+
+    async def _remove_insight_tail_widgets(self) -> None:
+        for w in getattr(self, "_insight_tail_widgets", []):
+            try:
+                await w.remove()
+            except Exception:  # noqa: BLE001 — widget may already be detached
+                continue
+        self._insight_tail_widgets = []
+
+    async def _mount_insight_tail(
+        self, scroll: VerticalScroll, tail: str | None,
+    ) -> None:
+        if not tail:
+            self._insight_tail_widgets = []
+            return
+        rule = Rule()
+        body = Markdown(tail)
+        await scroll.mount(rule)
+        await scroll.mount(body)
+        self._insight_tail_widgets = [rule, body]
 
     def _apply_segment_text(self, seg: TranscriptSegment, new_spoken: str) -> bool:
         new_text = _normalize_spaces(new_spoken)
         if not new_text:
             return False
         old_text = self._line_id_to_spoken.get(seg.line_id, seg.spoken_text)
-        if " ".join(old_text.split()) == " ".join(new_text.split()):
+        if old_text.split() == new_text.split():
             return False
         idx = self._line_id_to_index.get(seg.line_id)
         if idx is None or idx < 0 or idx >= len(self._lines):
@@ -2327,13 +1776,23 @@ class EchoApp(App[None]):
         self,
         snapshot: str,
         source_segments: list[TranscriptSegment] | None = None,
+        *,
+        session_id: int | None = None,
     ) -> None:
         if self._llm_offline:
             return
         llm_timeout = float(os.environ.get("ECHO_INSIGHT_LLM_TIMEOUT", "120"))
         ddg_timeout = float(os.environ.get("ECHO_INSIGHT_DDG_TIMEOUT", "45"))
 
+        def _is_stale() -> bool:
+            return session_id is not None and session_id != self._insight_session_id
+
         async with self._insight_lock:
+            # A reset between scheduling and acquiring the lock must abort the pass before any
+            # mutation so the stale snapshot does not leak into the new session.
+            if _is_stale():
+                self._debug_note("insight pass aborted reason=session_reset")
+                return
             next_n = len(self._insight_passes) + 1
             stamp = self._elapsed_hms()
             tail = (
@@ -2360,6 +1819,9 @@ class EchoApp(App[None]):
                         llm_route_insight(snapshot, segments=seg_payload, meeting_context=self.meeting_context),
                         timeout=llm_timeout,
                     )
+                    if _is_stale():
+                        self._debug_note("insight pass aborted reason=session_reset post-route")
+                        return
                 except asyncio.TimeoutError:
                     route = InsightRouteResult(
                         "comment",
@@ -2396,6 +1858,8 @@ class EchoApp(App[None]):
                         route.corrected_segments,
                     )
                 if applied:
+                    for seg in source_segments:
+                        self._line_id_to_flushed[seg.line_id] = True
                     await self._refresh_transcript_log()
                     corrected_md = None
                     self._debug_note("transcript rewrite applied")
@@ -2450,6 +1914,9 @@ class EchoApp(App[None]):
                     except Exception as e:  # noqa: BLE001
                         summary = f"_Web synthesis failed:_ `{e!s}`\n\n**Query:** `{query}`"
 
+                    if _is_stale():
+                        self._debug_note("insight pass aborted reason=session_reset post-web")
+                        return
                     web_md = _format_web_search_md(query, hits, ddg_err)
                     routing = _insight_routing_collapsible(route, web_path=True)
                     self._insight_passes.append(
@@ -2466,7 +1933,8 @@ class EchoApp(App[None]):
                 if source_segments:
                     for seg in source_segments:
                         self._line_id_to_flushed[seg.line_id] = True
-                    await self._refresh_transcript_log()
+                    if not applied:
+                        await self._refresh_transcript_log()
                 await self._refresh_insights_panel(tail=None)
             except Exception as e:  # noqa: BLE001
                 self.log.exception("insights panel failed")
@@ -2496,7 +1964,18 @@ class EchoApp(App[None]):
             chat.write("[yellow]LLM unavailable; chat is disabled.[/]")
             return
         chat.write(f"[bold cyan]You:[/] {q}")
-        full = "\n".join(self._lines)
+        lines = self._lines
+        cap = self.chat_context_max_lines
+        if len(lines) > cap:
+            tail = lines[-cap:]
+            omitted = len(lines) - cap
+            full = (
+                f"(…{omitted} earlier transcript line(s) omitted; "
+                f"raise ECHO_CHAT_CONTEXT_MAX_LINES to include more.)\n"
+                + "\n".join(tail)
+            )
+        else:
+            full = "\n".join(lines)
         try:
             ans = await llm_chat_answer(full, q, self.meeting_context)
         except Exception as e:  # noqa: BLE001 — demo surface errors in UI

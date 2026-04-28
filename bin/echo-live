@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ECHO_DEBUG=0 \
-ECHO_LIVE_CHAR_DELAY="${ECHO_LIVE_CHAR_DELAY:-0}" \
-ECHO_LIVE_CHUNK_OVERLAP_SECONDS="${ECHO_LIVE_CHUNK_OVERLAP_SECONDS:-1.0}" \
-exec echo-tui --live --live-system-authorized --whisper-device mps "$@"
+# Wrapper defaults: faster ASR for local live dev (override: pass --model-id after, last wins).
+ECHO_DEBUG="${ECHO_DEBUG:-0}" \
+ECHO_LIVE_CHUNK_OVERLAP_SECONDS="${ECHO_LIVE_CHUNK_OVERLAP_SECONDS:-0.3}" \
+exec echo-tui --live --live-system-authorized --whisper-device mps \
+  --model-id openai/whisper-small "$@"

@@ -128,16 +128,21 @@ Loads the same `.env` rules as the app (repo root then cwd), prints which LLM ro
 | `ECHO_LIVE_NOISE_MAX_RMS_FACTOR` | Relative RMS ceiling for noise-token suppression, scaled by `ECHO_LIVE_MIN_RMS` (default `1.3`). |
 | `ECHO_LIVE_NOISE_DROP_AT_SEGMENT_START` | If enabled (default `1`), drop configured noise tokens at the start of a new segment even when RMS is not low. |
 | `ECHO_LIVE_ASR_LOG_INTERVAL_SECONDS` | Interval for live ASR latency diagnostics in debug/log output (default `2.0`; set `0` to disable). |
+| `ECHO_LIVE_CAPTURE_OUT_QUEUE_MAX` | Max items in the live mixed-audio queue read by ASR (default `512`; was `256`). |
+| `ECHO_LIVE_CAPTURE_MIX_QUEUE_MAX` | Max items in mic/system per-side queues before mixing (default `256`; was `128`). |
+| `ECHO_LIVE_CAPTURE_OUT_Q_DROP_THRESHOLD` | **Live only.** If capture `out_q` depth is **greater than** this, discard the oldest `ECHO_LIVE_CAPTURE_OUT_Q_DROP_BATCH` blocks before draining (default `400`; `0` disables). |
+| `ECHO_LIVE_CAPTURE_OUT_Q_DROP_BATCH` | **Live only.** Oldest blocks removed when over threshold (default `30`; ~4s of audio at default blocksize). |
 | `ECHO_LIVE_SEGMENT_PAUSE_SECONDS` | Main live UI segmentation trigger: finalize current draft when silence reaches this threshold (default `2.0`). |
 | `ECHO_UI_SEGMENT_SEMANTIC_MIN_CHARS` | Minimum chars required before sentence-ending punctuation can finalize a segment (default `80`). |
 | `ECHO_UI_SEGMENT_MAX_SECONDS` | Forced UI segment split when a draft grows too long in time (default `25`). |
 | `ECHO_UI_SEGMENT_MAX_CHARS` | Forced UI segment split when a draft grows too long in text length (default `360`). |
-| `ECHO_INSIGHT_LIVE_MIN_SECONDS` | Live insight auxiliary trigger on newly added transcript duration (default `10`). |
-| `ECHO_INSIGHT_PAUSE_SECONDS` | Live idle-window trigger for insight evaluation (default `3`). |
-| `ECHO_INSIGHT_PAUSE_MIN_CHARS` | Minimum new chars required when triggering insights from idle pause (default `80`). |
-| `ECHO_INSIGHT_FINALIZED_SEGMENT_MIN_CHARS` | Minimum chars for a newly finalized segment to trigger insight directly (default `100`). |
-| `ECHO_INSIGHT_SKIP_MIN_CHARS` | Skip insight calls when new content is below this size (default `50`). |
-| `ECHO_INSIGHT_LIVE_MIN_INTERVAL` | Global live insight rate limiter in seconds (default `30`). |
+| `ECHO_INSIGHT_LIVE_MIN_SECONDS` | **`--live` only.** Auxiliary trigger on newly added transcript duration (default `10`). |
+| `ECHO_INSIGHT_PAUSE_SECONDS` | **`--live` only.** Idle-window trigger for insight evaluation (default `3`). |
+| `ECHO_INSIGHT_PAUSE_MIN_CHARS` | **`--live` only.** Minimum new chars when triggering insights from idle pause (default `80`). |
+| `ECHO_INSIGHT_FINALIZED_SEGMENT_MIN_CHARS` | **`--live` only.** Minimum chars for a newly finalized segment to trigger insight directly (default `100`). |
+| `ECHO_INSIGHT_SKIP_MIN_CHARS` | **`--live` only.** Skip insight calls when new content is below this size (default `50`). |
+| `ECHO_INSIGHT_LIVE_MIN_INTERVAL` | **`--live` only.** Insight rate limiter in seconds (default `45`). |
+| `ECHO_INSIGHT_PAUSE_CAPTURE_Q` | **`--live` only.** Do not start a new insight pass while capture `out_q` depth is at least this (default `400`; `0` disables). |
 | `ECHO_ENABLE_TRANSCRIPT_REWRITE` | Enable LLM rewrite-back to Transcript (`1`/`true`, default). Set `0` to keep Transcript raw ASR text and disable LLM rewrite-back. |
 | `ECHO_DEBUG` | Enable debug panel/log events. Default is `0` (off). Set `1` to enable debug event output and log-file writing. |
 | `ECHO_DEBUG_PANEL_LINES` | Debug panel history cap. Default `0` means unlimited history (no truncation). |

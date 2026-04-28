@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import queue
+import time
+from collections import deque
 import shlex
 import subprocess
 import sys
@@ -35,6 +37,14 @@ def _mix_mono_with_activity_gate(mic: object, sys: object, *, silence_floor: flo
         return np.clip(m2, -1.0, 1.0)
     mix = 0.5 * (m2 + s2)
     return np.clip(mix, -1.0, 1.0)
+
+
+def _drain_queue_nowait(q: queue.Queue) -> None:
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            break
 
 
 def _safe_queue_put(q: queue.Queue, item: object) -> None:
@@ -168,6 +178,8 @@ class LiveMixerConfig:
     system_device: int | None
     samplerate: int = 16000
     blocksize: int = 2048
+    capture_out_queue_max: int = 512
+    capture_mix_queue_max: int = 256
 
 
 @dataclass
@@ -185,6 +197,8 @@ class LiveSystemAuthorizedConfig:
     command: str
     samplerate: int = 16000
     blocksize: int = 2048
+    capture_out_queue_max: int = 512
+    capture_mix_queue_max: int = 256
 
 
 class LivePairedCapture:
@@ -193,11 +207,19 @@ class LivePairedCapture:
     def __init__(self, cfg: LiveMixerConfig) -> None:
         self.cfg = cfg
         self._stop = threading.Event()
-        self.out_q: queue.Queue = queue.Queue(maxsize=128)
-        self._mic_q: queue.Queue = queue.Queue(maxsize=64)
-        self._sys_q: queue.Queue = queue.Queue(maxsize=64)
+        self._pause_capture = threading.Event()
+        self.out_q: queue.Queue = queue.Queue(maxsize=max(1, int(cfg.capture_out_queue_max)))
+        self._mic_q: queue.Queue = queue.Queue(maxsize=max(1, int(cfg.capture_mix_queue_max)))
+        self._sys_q: queue.Queue = queue.Queue(maxsize=max(1, int(cfg.capture_mix_queue_max)))
         self._mix_thread: threading.Thread | None = None
         self._streams: list[object] = []
+
+    def set_capture_paused(self, paused: bool) -> None:
+        """When ``True``, callbacks and the mix thread stop enqueueing (streams stay open)."""
+        if paused:
+            self._pause_capture.set()
+        else:
+            self._pause_capture.clear()
 
     def start(self) -> None:
         import numpy as np
@@ -206,7 +228,7 @@ class LivePairedCapture:
         import sounddevice as sd
 
         def mic_cb(indata, frames: int, _time, status) -> None:  # noqa: ARG001
-            if self._stop.is_set():
+            if self._stop.is_set() or self._pause_capture.is_set():
                 return
             chunk = np.clip(indata.copy().reshape(-1), -1.0, 1.0)
             if self.cfg.system_device is None:
@@ -228,7 +250,7 @@ class LivePairedCapture:
         if self.cfg.system_device is not None:
 
             def sys_cb(indata, frames: int, _time, status) -> None:  # noqa: ARG001
-                if self._stop.is_set():
+                if self._stop.is_set() or self._pause_capture.is_set():
                     return
                 chunk = np.clip(indata.copy().reshape(-1), -1.0, 1.0)
                 _safe_queue_put(self._sys_q, chunk)
@@ -246,14 +268,24 @@ class LivePairedCapture:
 
             def mix_loop() -> None:
                 while not self._stop.is_set():
+                    if self._pause_capture.is_set():
+                        _drain_queue_nowait(self._mic_q)
+                        _drain_queue_nowait(self._sys_q)
+                        time.sleep(0.05)
+                        continue
                     try:
                         m = self._mic_q.get(timeout=0.2)
                     except queue.Empty:
+                        continue
+                    if self._pause_capture.is_set():
+                        _drain_queue_nowait(self._sys_q)
                         continue
                     try:
                         s = self._sys_q.get(timeout=0.2)
                     except queue.Empty:
                         _safe_queue_put(self.out_q, m)
+                        continue
+                    if self._pause_capture.is_set():
                         continue
                     mix = _mix_mono_with_activity_gate(m, s)
                     if mix.shape[0] <= 0:
@@ -265,6 +297,7 @@ class LivePairedCapture:
 
     def stop(self) -> None:
         self._stop.set()
+        self._pause_capture.clear()
         for st in self._streams:
             try:
                 st.stop()
@@ -302,21 +335,93 @@ def _resample_24k_to_16k(samples: object) -> object:
     return out.astype(np.float32, copy=False)
 
 
+class _Float32BlockStream:
+    """Append-only float32 mono stream with O(blocksize) chunk extraction (no whole-buffer concat)."""
+
+    __slots__ = ("_blocks", "_off0")
+
+    def __init__(self) -> None:
+        self._blocks: deque = deque()
+        self._off0 = 0
+
+    def clear(self) -> None:
+        self._blocks.clear()
+        self._off0 = 0
+
+    def _sample_count(self) -> int:
+        if not self._blocks:
+            return 0
+        total = 0
+        for i, b in enumerate(self._blocks):
+            if i == 0:
+                total += int(b.size) - self._off0
+            else:
+                total += int(b.size)
+        return total
+
+    def append(self, arr: object) -> None:
+        import numpy as np
+
+        a = np.asarray(arr, dtype=np.float32).reshape(-1)
+        if a.size:
+            self._blocks.append(a)
+
+    def take_block(self, blocksize: int, dest: object) -> bool:
+        """Copy first ``blocksize`` samples into ``dest``, remove them from the stream; return False if short."""
+        import numpy as np
+
+        if self._sample_count() < blocksize:
+            return False
+        d = np.asarray(dest, dtype=np.float32).reshape(-1)
+        assert d.size >= blocksize
+        filled = 0
+        for bi, b in enumerate(self._blocks):
+            start = self._off0 if bi == 0 else 0
+            avail = int(b.size) - start
+            take = min(avail, blocksize - filled)
+            d[filled : filled + take] = b[start : start + take]
+            filled += take
+            if filled >= blocksize:
+                break
+        self._consume(blocksize)
+        return True
+
+    def _consume(self, n: int) -> None:
+        remaining = n
+        while remaining > 0 and self._blocks:
+            b0 = self._blocks[0]
+            avail = int(b0.size) - self._off0
+            take = min(avail, remaining)
+            self._off0 += take
+            remaining -= take
+            if self._off0 >= int(b0.size):
+                self._blocks.popleft()
+                self._off0 = 0
+
+
 class LiveSystemAuthorizedCapture:
     """Mic + system-output capture via external authorized command (no virtual loopback required)."""
 
     def __init__(self, cfg: LiveSystemAuthorizedConfig) -> None:
         self.cfg = cfg
         self._stop = threading.Event()
-        self.out_q: queue.Queue = queue.Queue(maxsize=128)
-        self._mic_q: queue.Queue = queue.Queue(maxsize=64)
-        self._sys_q: queue.Queue = queue.Queue(maxsize=64)
+        self._pause_capture = threading.Event()
+        self.out_q: queue.Queue = queue.Queue(maxsize=max(1, int(cfg.capture_out_queue_max)))
+        self._mic_q: queue.Queue = queue.Queue(maxsize=max(1, int(cfg.capture_mix_queue_max)))
+        self._sys_q: queue.Queue = queue.Queue(maxsize=max(1, int(cfg.capture_mix_queue_max)))
         self._mix_thread: threading.Thread | None = None
         self._sys_read_thread: threading.Thread | None = None
         self._sys_err_thread: threading.Thread | None = None
         self._streams: list[object] = []
         self._proc: subprocess.Popen[bytes] | None = None
         self.last_stderr_line: str = ""
+
+    def set_capture_paused(self, paused: bool) -> None:
+        """When ``True``, mic callback, system reader, and mix thread stop feeding ``out_q``."""
+        if paused:
+            self._pause_capture.set()
+        else:
+            self._pause_capture.clear()
 
     def start(self) -> None:
         import numpy as np
@@ -344,7 +449,7 @@ class LiveSystemAuthorizedCapture:
             raise RuntimeError("Failed to start system-audio capture process.")
 
         def mic_cb(indata, frames: int, _time, status) -> None:  # noqa: ARG001
-            if self._stop.is_set():
+            if self._stop.is_set() or self._pause_capture.is_set():
                 return
             chunk = np.clip(indata.copy().reshape(-1), -1.0, 1.0)
             _safe_queue_put(self._mic_q, chunk)
@@ -363,7 +468,8 @@ class LiveSystemAuthorizedCapture:
         def sys_read_loop() -> None:
             assert self._proc is not None and self._proc.stdout is not None
             raw_buf = bytearray()
-            out_buf = np.zeros((0,), dtype=np.float32)
+            stream = _Float32BlockStream()
+            blk_ws = np.empty((self.cfg.blocksize,), dtype=np.float32)
             bytes_per_frame = 4  # 2ch * s16
             while not self._stop.is_set():
                 data = self._proc.stdout.read(4096)
@@ -381,11 +487,12 @@ class LiveSystemAuthorizedCapture:
                 mono_16k = _resample_24k_to_16k(mono_24k)
                 if mono_16k.size == 0:
                     continue
-                out_buf = np.concatenate([out_buf, mono_16k.astype(np.float32, copy=False)])
-                while out_buf.size >= self.cfg.blocksize:
-                    blk = out_buf[: self.cfg.blocksize]
-                    out_buf = out_buf[self.cfg.blocksize :]
-                    _safe_queue_put(self._sys_q, np.clip(blk, -1.0, 1.0))
+                stream.append(mono_16k)
+                while stream.take_block(self.cfg.blocksize, blk_ws):
+                    if self._pause_capture.is_set():
+                        continue
+                    # Fresh array per block: mix thread may still hold a prior queue item.
+                    _safe_queue_put(self._sys_q, np.clip(blk_ws, -1.0, 1.0))
 
         def sys_err_loop() -> None:
             assert self._proc is not None and self._proc.stderr is not None
@@ -397,14 +504,24 @@ class LiveSystemAuthorizedCapture:
 
         def mix_loop() -> None:
             while not self._stop.is_set():
+                if self._pause_capture.is_set():
+                    _drain_queue_nowait(self._mic_q)
+                    _drain_queue_nowait(self._sys_q)
+                    time.sleep(0.05)
+                    continue
                 try:
                     m = self._mic_q.get(timeout=0.2)
                 except queue.Empty:
+                    continue
+                if self._pause_capture.is_set():
+                    _drain_queue_nowait(self._sys_q)
                     continue
                 try:
                     s = self._sys_q.get(timeout=0.2)
                 except queue.Empty:
                     _safe_queue_put(self.out_q, m)
+                    continue
+                if self._pause_capture.is_set():
                     continue
                 mix = _mix_mono_with_activity_gate(m, s)
                 if mix.shape[0] <= 0:
@@ -432,6 +549,7 @@ class LiveSystemAuthorizedCapture:
 
     def stop(self) -> None:
         self._stop.set()
+        self._pause_capture.clear()
         for st in self._streams:
             try:
                 st.stop()

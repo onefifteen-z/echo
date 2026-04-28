@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ECHO_DEBUG=1 \
+# Debug wrapper: panel + ASR latency logs; default whisper-medium (override: --model-id after, last wins).
+ECHO_DEBUG="${ECHO_DEBUG:-1}" \
 ECHO_LIVE_ASR_LOG_INTERVAL_SECONDS="${ECHO_LIVE_ASR_LOG_INTERVAL_SECONDS:-1}" \
 ECHO_LIVE_CHAR_DELAY="${ECHO_LIVE_CHAR_DELAY:-0}" \
 ECHO_LIVE_CHUNK_OVERLAP_SECONDS="${ECHO_LIVE_CHUNK_OVERLAP_SECONDS:-0.3}" \
-exec echo-tui --live --live-system-authorized --whisper-device mps "$@"
+exec echo-tui --live --live-system-authorized --whisper-device mps \
+  --model-id openai/whisper-small "$@"
