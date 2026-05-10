@@ -690,14 +690,23 @@ class LiveTranscriptionSession:
             live_now = time.monotonic() - (app._live_wall_t0 or time.monotonic())
             lag_secs = max(0.0, live_now - t1w)
             e2e_delay_secs = max(0.0, live_now - t0w)
+            cap_q = self._capture_out_queue_depth()
+            app._live_capture_queue_depth = cap_q
+            buf_s = self._audio_stream_sample_count() / float(self._sr)
+            buf_chunks = self._pending_asr_chunk_iterations()
+            app._update_live_diagnostics(
+                decode_secs=decode_secs,
+                rtf=rtf,
+                lag_secs=lag_secs,
+                e2e_delay_secs=e2e_delay_secs,
+                cap_q=cap_q,
+                buf_s=buf_s,
+                buf_chunks=buf_chunks,
+            )
             if app.live_asr_log_interval_seconds > 0.0:
                 if (
                     time.monotonic() - app._last_asr_latency_debug_at
                 ) >= app.live_asr_log_interval_seconds:
-                    cap_q = self._capture_out_queue_depth()
-                    app._live_capture_queue_depth = cap_q
-                    buf_s = self._audio_stream_sample_count() / float(self._sr)
-                    buf_chunks = self._pending_asr_chunk_iterations()
                     app._debug_note(
                         "asr latency "
                         f"decode={decode_secs*1000:.0f}ms chunk={chunk_secs:.2f}s "

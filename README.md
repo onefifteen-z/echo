@@ -120,7 +120,7 @@ Loads the same `.env` rules as the app (repo root then cwd), prints which LLM ro
 | `ECHO_INSIGHT_DDG_TIMEOUT` | Seconds for each ddgs web search in insights (default `45`). |
 | `ECHO_DDGS_BACKEND` | Metasearch backend for the `ddgs` library: `auto` (default), `bing`, `duckduckgo`, `yahoo`, … (see [ddgs docs](https://pypi.org/project/ddgs/)). If unset and `auto` returns nothing, Echo tries `bing`, then `duckduckgo`, then `yahoo`. |
 | `ECHO_NO_SPLASH` | Set to `1` / `true` / `yes` to skip the green ASCII **ECHO** startup splash (e.g. for automation). |
-| `ECHO_WHISPER_LANGUAGE` | Whisper `language=` for forced decoder ids (default `japanese` for Kotoba). Set e.g. `english` for other models. |
+| `ECHO_WHISPER_LANGUAGE` | Whisper `language=` for forced decoder ids (default `japanese` for Kotoba). Set e.g. `english` or `chinese` for other models. |
 | `ECHO_LIVE_EMIT_INTERVAL` | Legacy batch mode knob for live transcript flushing. `0` (default) keeps Echo in append-draft mode and uses semantic/pause/length segmentation rules. Positive values switch to interval batching. |
 | `ECHO_LIVE_NOISE_TOKENS` | Comma-separated short tokens to suppress in live ASR when they look like low-energy noise hallucinations (default: `ごめん`). |
 | `ECHO_LIVE_ALWAYS_DROP_NOISE_TOKENS` | Comma-separated tokens to always suppress when matched (default: `ごめん`), regardless of RMS or segment position. |

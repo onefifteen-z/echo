@@ -683,6 +683,7 @@ class EchoApp(App[None]):
         Binding("c", "clear_chat", "Clear chat", priority=True),
         Binding("r", "reset", "Reset", priority=True),
         Binding("l", "cycle_live_language", "Language", priority=True),
+        Binding("d", "toggle_live_diagnostics", "Delay", priority=True),
         Binding("i", "focus_insights", "Insights", priority=True),
         Binding("t", "focus_transcript", "Transcript", priority=True),
         Binding("q", "quit", "Quit", priority=True),
@@ -761,7 +762,7 @@ class EchoApp(App[None]):
         )
         self._workers_started = False
         self._resume_after_setup = False
-        self.live_asr_languages = ("japanese", "english")
+        self.live_asr_languages = ("japanese", "english", "chinese")
         env_lang = (os.environ.get("ECHO_WHISPER_LANGUAGE") or "japanese").strip().lower() or "japanese"
         self.live_asr_language = (
             env_lang
@@ -847,6 +848,15 @@ class EchoApp(App[None]):
         self._debug_log_path: Path | None = None
         self._last_min_interval_debug_at = 0.0
         self._last_asr_latency_debug_at = 0.0
+        self._show_live_diagnostics = False
+        self._live_diag_decode_ms = 0.0
+        self._live_diag_rtf = 0.0
+        self._live_diag_lag_secs = 0.0
+        self._live_diag_e2e_delay_secs = 0.0
+        self._live_diag_cap_q = -1
+        self._live_diag_buf_s = 0.0
+        self._live_diag_buf_chunks = 0
+        self._live_diag_updated_at = 0.0
         if self.debug_enabled:
             try:
                 log_dir = Path.cwd() / "log"
@@ -918,7 +928,8 @@ class EchoApp(App[None]):
         else:
             mode = "Text replay"
         off = " · no LLM" if self._llm_offline else ""
-        self.sub_title = f"🎙 {mode}{off}  [{self._elapsed_hms()}]  p/s/c/r/l/q"
+        lang = f" · lang={self.live_asr_language}" if self.live_audio else ""
+        self.sub_title = f"🎙 {mode}{off}{lang}  [{self._elapsed_hms()}]  p/s/c/r/l/d/q"
         self.set_interval(1.0, self._tick_header)
         self.set_interval(0.15, self._tick_input_meter)
         if self.debug_enabled:
@@ -1007,7 +1018,8 @@ class EchoApp(App[None]):
         else:
             mode = "Text"
         off = " · no LLM" if self._llm_offline else ""
-        self.sub_title = f"🎙 {mode} · {state}{off}  [{self._elapsed_hms()}]  p/s/c/r/l/q"
+        lang = f" · lang={self.live_asr_language}" if self.live_audio else ""
+        self.sub_title = f"🎙 {mode} · {state}{off}{lang}  [{self._elapsed_hms()}]  p/s/c/r/l/d/q"
 
     def _input_meter_text(self, *, chart_cols: int | None = None) -> str:
         if not self.live_audio:
@@ -1042,10 +1054,51 @@ class EchoApp(App[None]):
             rows=_METER_CHART_ROWS,
         )
         chart_block = "\n".join(chart)
+        diag = ""
+        if self._show_live_diagnostics:
+            if self._live_diag_updated_at <= 0.0:
+                diag = "\nDelay: waiting for first ASR chunk..."
+            else:
+                age_s = max(0.0, time.monotonic() - self._live_diag_updated_at)
+                cap_q_txt = str(self._live_diag_cap_q) if self._live_diag_cap_q >= 0 else "?"
+                diag = (
+                    "\n"
+                    "Delay: "
+                    f"decode={self._live_diag_decode_ms:.0f}ms "
+                    f"rtf={self._live_diag_rtf:.2f} "
+                    f"lag={self._live_diag_lag_secs:.2f}s "
+                    f"e2e={self._live_diag_e2e_delay_secs:.2f}s\n"
+                    "Buffer: "
+                    f"cap_q={cap_q_txt} "
+                    f"asr_buf={self._live_diag_buf_s:.2f}s "
+                    f"chunks={self._live_diag_buf_chunks} "
+                    f"updated={age_s:.1f}s ago"
+                )
         return (
             f"Input level · {state}\n"
             f"{chart_block}"
+            f"{diag}"
         )
+
+    def _update_live_diagnostics(
+        self,
+        *,
+        decode_secs: float,
+        rtf: float,
+        lag_secs: float,
+        e2e_delay_secs: float,
+        cap_q: int,
+        buf_s: float,
+        buf_chunks: int,
+    ) -> None:
+        self._live_diag_decode_ms = max(0.0, float(decode_secs)) * 1000.0
+        self._live_diag_rtf = max(0.0, float(rtf))
+        self._live_diag_lag_secs = max(0.0, float(lag_secs))
+        self._live_diag_e2e_delay_secs = max(0.0, float(e2e_delay_secs))
+        self._live_diag_cap_q = int(cap_q)
+        self._live_diag_buf_s = max(0.0, float(buf_s))
+        self._live_diag_buf_chunks = max(0, int(buf_chunks))
+        self._live_diag_updated_at = time.monotonic()
 
     def _tick_input_meter(self) -> None:
         if self.live_audio:
@@ -1184,6 +1237,14 @@ class EchoApp(App[None]):
         self._live_peak_hist = [0.0] * self.live_meter_history_width
         self._last_live_emitted_spoken = ""
         self._live_meter_note = "Listening..." if self.live_audio else "Available in --live mode."
+        self._live_diag_decode_ms = 0.0
+        self._live_diag_rtf = 0.0
+        self._live_diag_lag_secs = 0.0
+        self._live_diag_e2e_delay_secs = 0.0
+        self._live_diag_cap_q = -1
+        self._live_diag_buf_s = 0.0
+        self._live_diag_buf_chunks = 0
+        self._live_diag_updated_at = 0.0
         self._live_reset_seq += 1
 
         self.query_one("#transcript", RichLog).clear()
@@ -1211,7 +1272,19 @@ class EchoApp(App[None]):
         cur = self.live_asr_languages.index(self.live_asr_language)
         self.live_asr_language = self.live_asr_languages[(cur + 1) % len(self.live_asr_languages)]
         self._debug_note(f"live ASR language -> {self.live_asr_language}")
+        self._tick_header()
         self.notify(f"Live ASR language: {self.live_asr_language}", timeout=2)
+
+    def action_toggle_live_diagnostics(self) -> None:
+        if not self.live_audio:
+            self.notify("Delay diagnostics are available in --live mode.", timeout=2)
+            return
+        self._show_live_diagnostics = not self._show_live_diagnostics
+        self._tick_input_meter()
+        self.notify(
+            "Delay diagnostics: ON" if self._show_live_diagnostics else "Delay diagnostics: OFF",
+            timeout=2,
+        )
 
     def on_unmount(self) -> None:
         # Failures here must not block app shutdown (slow disk, permission errors, etc.).
