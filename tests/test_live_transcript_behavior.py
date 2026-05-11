@@ -144,6 +144,201 @@ def test_live_voice_gate_accepts_speech_like_chunk() -> None:
     )
 
 
+def test_live_vad_drops_chunk_below_threshold(monkeypatch) -> None:
+    """When VAD ratio < min_speech_ratio, the chunk is dropped before Whisper."""
+    import asyncio
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    import echo.app as app_mod
+    import echo.audio_filters as af
+    import echo.live_session as live_session_mod
+    from echo.live_session import LiveTranscriptionSession
+
+    # Force the energy gate to always pass so we exercise the new VAD branch.
+    monkeypatch.setattr(app_mod, "_passes_live_voice_gate", lambda **_kw: True)
+
+    # Stub VAD: report only 5% speech.
+    monkeypatch.setattr(af, "vad_speech_ratio", lambda *_a, **_k: 0.05)
+
+    # Whisper must NOT be invoked when the gate trips.
+    transcribe_calls: list[object] = []
+
+    def _fake_transcribe(*_args, **_kwargs):
+        transcribe_calls.append(_args)
+        return "should-not-run"
+
+    import echo.asr as asr_mod
+
+    monkeypatch.setattr(asr_mod, "transcribe_mono16k_chunk", _fake_transcribe)
+
+    debug_notes: list[str] = []
+    fake_app = SimpleNamespace(
+        # VAD knobs
+        live_vad_backend="silero",
+        live_vad_min_speech_ratio=0.10,
+        live_vad_speech_prob_threshold=0.5,
+        live_vad_aggressiveness=2,
+        # Denoise knobs (off so it does not interfere)
+        live_denoise_backend="off",
+        live_denoise_strength=0.85,
+        # Energy gate knobs (irrelevant - we forced the gate above)
+        live_min_rms=0.0035,
+        live_active_amp=0.012,
+        live_min_active_ratio=0.015,
+        # ASR knobs
+        live_asr_language="japanese",
+        model_id="whisper-stub",
+        whisper_device=None,
+        live_asr_log_interval_seconds=0.0,
+        live_emit_interval=15.0,
+        # Pause / wall-clock state
+        _paused=False,
+        _live_wall_t0=None,
+        _live_meter_rms=0.0,
+        _live_meter_peak=0.0,
+        _live_meter_last_signal_at=0.0,
+        _live_meter_note="Listening...",
+        _live_capture_queue_depth=-1,
+        _last_silence_debug_at=0.0,
+        _last_asr_latency_debug_at=0.0,
+        _debug_note=debug_notes.append,
+        _update_live_diagnostics=lambda **_kw: None,
+    )
+
+    # Build the session and seed its audio buffer with one full chunk of "loud" audio.
+    log = SimpleNamespace()
+    session = LiveTranscriptionSession.__new__(LiveTranscriptionSession)
+    session.app = fake_app
+    session.log = log
+    session._cap = None
+    session._system_cap = None
+    session._sr = 16000
+    session._chunk_samples = 16000  # 1s window
+    session._hop_samples = 16000
+    session._audio_blocks = __import__("collections").deque()
+    session._audio_block0_off = 0
+    session._piece_workspace = np.zeros(session._chunk_samples, dtype=np.float32)
+    session._last_chunk_text = ""
+    session._pending_texts = []
+    session._pending_t0w = None
+    session._pending_t1w = None
+    session._pending_allow_correction = True
+    session._last_voiced_wall = 0.0
+    session._draft_segment = None
+    session._draft_t0w = None
+    session._draft_allow_correction = True
+    session._draft_stable_after = 0.0
+    session._draft_last_snapshot_text = ""
+    session._draft_last_snapshot_at = 0.0
+    session._lang = "japanese"
+    session._post_pause_drain_insight_done = False
+
+    # 1 second of saturated audio: easily passes the (forced) energy gate.
+    session._append_audio_block(np.full(16000, 0.5, dtype=np.float32))
+
+    asyncio.run(session._async_run_buffered_asr_pass(log))
+
+    assert transcribe_calls == [], "Whisper was called even though VAD gate should have dropped the chunk"
+    assert fake_app._live_meter_note == "VAD gate"
+    assert any("vad drop" in n for n in debug_notes), debug_notes
+    # Buffer should be drained after the hop.
+    assert session._audio_stream_sample_count() == 0
+
+
+def test_live_denoise_runs_before_vad(monkeypatch) -> None:
+    """When denoise backend is enabled, the pipeline calls denoise() *before* vad_speech_ratio()."""
+    import asyncio
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    import echo.app as app_mod
+    import echo.audio_filters as af
+    from echo.live_session import LiveTranscriptionSession
+
+    monkeypatch.setattr(app_mod, "_passes_live_voice_gate", lambda **_kw: True)
+
+    call_order: list[str] = []
+
+    def _fake_denoise(samples, **_kwargs):
+        call_order.append("denoise")
+        # Mark the array so we can prove the VAD step received the post-denoise audio.
+        return np.full_like(samples, 0.123, dtype=np.float32)
+
+    def _fake_vad(samples, **_kwargs):
+        call_order.append("vad")
+        # Confirm we are inspecting the denoised tensor.
+        assert abs(float(samples[0]) - 0.123) < 1e-6
+        # Force a drop so we do not have to stub the full Whisper post-processing chain.
+        return 0.0
+
+    monkeypatch.setattr(af, "denoise", _fake_denoise)
+    monkeypatch.setattr(af, "vad_speech_ratio", _fake_vad)
+
+    fake_app = SimpleNamespace(
+        live_vad_backend="silero",
+        live_vad_min_speech_ratio=0.10,
+        live_vad_speech_prob_threshold=0.5,
+        live_vad_aggressiveness=2,
+        live_denoise_backend="noisereduce",
+        live_denoise_strength=0.85,
+        live_min_rms=0.0035,
+        live_active_amp=0.012,
+        live_min_active_ratio=0.015,
+        live_asr_language="japanese",
+        model_id="whisper-stub",
+        whisper_device=None,
+        live_asr_log_interval_seconds=0.0,
+        live_emit_interval=15.0,
+        _paused=False,
+        _live_wall_t0=None,
+        _live_meter_rms=0.0,
+        _live_meter_peak=0.0,
+        _live_meter_last_signal_at=0.0,
+        _live_meter_note="Listening...",
+        _live_capture_queue_depth=-1,
+        _last_silence_debug_at=0.0,
+        _last_asr_latency_debug_at=0.0,
+        _debug_note=lambda _msg: None,
+        _update_live_diagnostics=lambda **_kw: None,
+    )
+
+    log = SimpleNamespace()
+    session = LiveTranscriptionSession.__new__(LiveTranscriptionSession)
+    session.app = fake_app
+    session.log = log
+    session._cap = None
+    session._system_cap = None
+    session._sr = 16000
+    session._chunk_samples = 16000
+    session._hop_samples = 16000
+    session._audio_blocks = __import__("collections").deque()
+    session._audio_block0_off = 0
+    session._piece_workspace = np.zeros(session._chunk_samples, dtype=np.float32)
+    session._last_chunk_text = ""
+    session._pending_texts = []
+    session._pending_t0w = None
+    session._pending_t1w = None
+    session._pending_allow_correction = True
+    session._last_voiced_wall = 0.0
+    session._draft_segment = None
+    session._draft_t0w = None
+    session._draft_allow_correction = True
+    session._draft_stable_after = 0.0
+    session._draft_last_snapshot_text = ""
+    session._draft_last_snapshot_at = 0.0
+    session._lang = "japanese"
+    session._post_pause_drain_insight_done = False
+
+    session._append_audio_block(np.full(16000, 0.5, dtype=np.float32))
+
+    asyncio.run(session._async_run_buffered_asr_pass(log))
+
+    assert call_order == ["denoise", "vad"]
+
+
 def test_should_trigger_insight_live_skips_without_finalized_segment() -> None:
     from echo.app import _should_trigger_insight_live
 

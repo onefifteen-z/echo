@@ -1,7 +1,8 @@
 """Optional user-supplied glossary loaded from a single YAML file.
 
-Terms from this file are injected into both the Whisper initial prompt and the LLM prompts so
-ASR + calibration prefer canonical spellings for proper nouns / jargon / names.
+Terms from this file are injected into LLM prompts (transcript correction, web synthesis, chat)
+so the model prefers canonical spellings for proper nouns / jargon / names when the transcript
+clearly refers to them.
 
 Supported YAML shapes (all flattened to the same deduped, order-preserving list):
 

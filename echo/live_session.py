@@ -632,6 +632,7 @@ class LiveTranscriptionSession:
             _trim_chunk_overlap,
         )
         from echo.asr import transcribe_mono16k_chunk
+        from echo.audio_filters import denoise, vad_speech_ratio
 
         app = self.app
         ws = self._piece_workspace
@@ -667,6 +668,49 @@ class LiveTranscriptionSession:
                 await self._flush_if_needed(idle_tick=True)
                 progressed = True
                 continue
+
+            # Optional denoise stage (spectral gating). Runs in a worker so a slow noisereduce
+            # call does not stall the event loop.
+            if app.live_denoise_backend != "off":
+                try:
+                    piece = await asyncio.to_thread(
+                        denoise,
+                        piece,
+                        backend=app.live_denoise_backend,
+                        sr=self._sr,
+                        prop_decrease=app.live_denoise_strength,
+                        notify=app._debug_note,
+                    )
+                except Exception as e:  # noqa: BLE001 -- never let filters break the loop
+                    app._debug_note(f"denoise error: {e!s}")
+
+            # Optional model-based VAD layered on top of the cheap energy gate.
+            if app.live_vad_backend != "off":
+                try:
+                    speech_ratio = await asyncio.to_thread(
+                        vad_speech_ratio,
+                        piece,
+                        backend=app.live_vad_backend,
+                        sr=self._sr,
+                        speech_prob_threshold=app.live_vad_speech_prob_threshold,
+                        aggressiveness=app.live_vad_aggressiveness,
+                        notify=app._debug_note,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    app._debug_note(f"vad error: {e!s}")
+                    speech_ratio = 1.0
+                if speech_ratio < app.live_vad_min_speech_ratio:
+                    if not app._paused:
+                        app._live_meter_note = "VAD gate"
+                        app._debug_note(
+                            f"vad drop ratio={speech_ratio:.2f} "
+                            f"thr={app.live_vad_min_speech_ratio:.2f} "
+                            f"backend={app.live_vad_backend}",
+                        )
+                    await self._flush_if_needed(idle_tick=True)
+                    progressed = True
+                    continue
+
             app._live_capture_queue_depth = self._capture_out_queue_depth()
             try:
                 asr_t0 = time.monotonic()
@@ -676,7 +720,6 @@ class LiveTranscriptionSession:
                     model_id=app.model_id,
                     device=app.whisper_device,
                     language=app.live_asr_language or self._lang,
-                    prompt_text=app._meeting_asr_prompt() or None,
                 )
                 asr_t1 = time.monotonic()
             except Exception as e:  # noqa: BLE001

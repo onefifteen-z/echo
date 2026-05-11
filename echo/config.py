@@ -31,13 +31,30 @@ def _truthy(value: str | None) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _get_int(env: Mapping[str, str], key: str, default: int, *, low: int | None = None) -> int:
+def _normalize_choice(value: str | None, *, allowed: tuple[str, ...], default: str) -> str:
+    """Lowercase + whitelist guard for env-driven enum knobs."""
+    if value is None:
+        return default
+    v = value.strip().lower()
+    return v if v in allowed else default
+
+
+def _get_int(
+    env: Mapping[str, str],
+    key: str,
+    default: int,
+    *,
+    low: int | None = None,
+    high: int | None = None,
+) -> int:
     try:
         v = int(env.get(key, str(default)))
     except (TypeError, ValueError):
         v = default
     if low is not None:
         v = max(low, v)
+    if high is not None:
+        v = min(high, v)
     return v
 
 
@@ -99,6 +116,16 @@ class LiveConfig:
     capture_out_q_drop_threshold: int = 400
     capture_out_q_drop_batch: int = 30
 
+    # VAD (real per-frame model layered on top of the energy gate).
+    vad_backend: str = "off"  # "off" | "silero" | "webrtc"
+    vad_min_speech_ratio: float = 0.10
+    vad_speech_prob_threshold: float = 0.5  # Silero per-frame probability cutoff
+    vad_aggressiveness: int = 2  # WebRTC 0..3
+
+    # Denoise stage (spectral gating before Whisper).
+    denoise_backend: str = "off"  # "off" | "noisereduce"
+    denoise_strength: float = 0.85  # noisereduce ``prop_decrease`` 0..1
+
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "LiveConfig":
         e = env if env is not None else os.environ
@@ -126,6 +153,28 @@ class LiveConfig:
                 e, "ECHO_LIVE_CAPTURE_OUT_Q_DROP_THRESHOLD", 400, low=0,
             ),
             capture_out_q_drop_batch=_get_int(e, "ECHO_LIVE_CAPTURE_OUT_Q_DROP_BATCH", 30, low=1),
+            vad_backend=_normalize_choice(
+                e.get("ECHO_LIVE_VAD"),
+                allowed=("off", "silero", "webrtc"),
+                default="off",
+            ),
+            vad_min_speech_ratio=_get_float(
+                e, "ECHO_LIVE_VAD_MIN_SPEECH_RATIO", 0.10, low=0.0, high=1.0,
+            ),
+            vad_speech_prob_threshold=_get_float(
+                e, "ECHO_LIVE_VAD_SPEECH_PROB_THRESHOLD", 0.5, low=0.0, high=1.0,
+            ),
+            vad_aggressiveness=_get_int(
+                e, "ECHO_LIVE_VAD_AGGRESSIVENESS", 2, low=0, high=3,
+            ),
+            denoise_backend=_normalize_choice(
+                e.get("ECHO_LIVE_DENOISE"),
+                allowed=("off", "noisereduce"),
+                default="off",
+            ),
+            denoise_strength=_get_float(
+                e, "ECHO_LIVE_DENOISE_STRENGTH", 0.85, low=0.0, high=1.0,
+            ),
         )
 
 

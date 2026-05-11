@@ -21,6 +21,8 @@ AGENT_MD_MARKER = "## Echo runtime digest (injected into LLM prompts)"
 # comes from ``INSIGHT_COMMENT_STYLE_RULES`` inside ``INSIGHT_ROUTE_CORE``).
 _AGENT_DIGEST_FALLBACK = """**Transcript / ASR:** Treat input as noisy STT; return `corrected_transcript` with same meaning, fixing probable errors; never invent facts or new lines.
 
+**Japanese ASR hallucination cleanup (drop, do not rewrite):** Whisper-family models often inject news-broadcast boilerplate such as **徳島新聞社**, **知事**, **記者** (and similar wire-service tokens like **NHK**, **共同通信**, **読売新聞**, **〜放送局**). When these tokens appear with **no support** from the meeting title / background context and **no support** from surrounding sentences in the same chunk, treat them as ASR hallucinations: **delete the offending phrase (or the whole stranded sentence if removing the phrase leaves nonsense)** in `corrected_transcript` and `corrected_segments`; do **not** try to rephrase or substitute. Keep them only if the meeting context is genuinely about Tokushima / journalism / prefectural administration, or if the surrounding chunk clearly grounds the reference.
+
 **Routing:** Choose `comment` vs `web_search` per the routing instructions below. When `action` is `comment`, the `comment` field must follow the **McKinsey-style rules** block at the top of the routed prompt (not repeated here).
 
 **Web search:** `comment` empty; sharp `search_query`; still return `corrected_transcript`."""
@@ -223,7 +225,8 @@ INSIGHT_COMMENT_STYLE_RULES = """**Insight `comment` — McKinsey-style message 
 - **Pyramid:** Open with **one** sentence that states the **governing thought** (So what / the answer). No warm-up or “in this chunk…” framing.
 - **Support:** **At most 2** bullets; each must be a **distinct** point **grounded only in the chunk**; omit bullets if the lead alone is enough. Do not repeat the lead in bullets.
 - **Now what:** End with **one** line: concrete next step, decision, or owner—still declarative.
-- **~90 words** maximum for `comment`; same language as the transcript; **no questions** (avoid `?`); no section headers; do not name consulting frameworks (MECE, 7S, etc.) unless the transcript already uses them."""
+- **~90 words** maximum for `comment`; same language as the transcript; **no questions** (avoid `?`); no section headers; do not name consulting frameworks (MECE, 7S, etc.) unless the transcript already uses them.
+- **Glossary discipline:** the glossary block is a **spelling reference only**. A glossary term may appear in `comment` **only** if the **same entity is already explicitly mentioned in this chunk** (or unambiguously implied by it) **and** the spoken wording is plausibly that term under typical ASR/pronunciation confusion. **Never** name people, companies, products, or acronyms from the glossary that are not actually in the chunk; **never** treat the glossary as a list of topics to discuss; when in doubt, omit the glossary term."""
 
 
 INSIGHT_ROUTE_CORE = f"""{INSIGHT_COMMENT_STYLE_RULES}
@@ -239,11 +242,35 @@ Meeting (provided by user):
 <<<MEETING_CONTEXT>>>
 >>>
 
-Preferred glossary (use these EXACT spellings whenever the transcript clearly refers to one of
-them; do NOT inject these terms where they do not fit acoustically/semantically):
+Preferred glossary (canonical spellings below). The list is **not** extra meeting facts — it is a
+hint list for fixing ASR / proper-noun spelling **only** when **both** are true:
+(1) A spoken fragment in the chunk is **plausibly** the same entity under typical ASR error
+(pronunciation-level similarity: homophone-like confusions, common partial-word mixes, minor
+boundary mistakes).
+(2) The **meeting title / background context** plus surrounding lines in the chunk make that entity
+**semantically** sensible (not a coincidence because the word appears in the glossary).
+
+Do **NOT** sprinkle glossary nouns into `corrected_transcript`, `corrected_segments`, or `comment`
+just because they appear in the list. Do **NOT** add sentences, entities, or numbers from the glossary
+that are absent from the raw chunk. When unsure, keep the raw ASR wording instead of forcing a match.
+
 <<<
 <<<DICTIONARY>>>
 >>>
+
+Japanese ASR hallucination cleanup (delete, do not rewrite): Whisper-family models tend to inject
+news-broadcast boilerplate when audio is noisy or contains pauses/music. Tokens that frequently
+hallucinate include **徳島新聞社**, **知事**, **記者**, plus similar wire-service / broadcaster
+words (e.g. **NHK**, **共同通信**, **読売新聞**, **〜放送局**, **アナウンサー**).
+- When such a token appears and is **NOT** supported by the meeting title / background-context
+  block above, **and** is also unsupported by surrounding sentences in the chunk: treat it as a
+  hallucination. **Remove** the offending phrase from `corrected_transcript` and the matching
+  entry in `corrected_segments`. If removing the phrase leaves a meaningless stub
+  (e.g. only filler particles or a dangling 「と」), drop the whole sentence; if the stub still
+  reads as a normal Japanese sentence, keep the stub.
+- Do **NOT** substitute another noun, do **NOT** invent a topic to justify the token, and do
+  **NOT** drop content that is clearly grounded in the meeting context just because it overlaps
+  with this watch-list.
 
 Return ONLY valid JSON (no markdown code fences) with exactly these keys:
 - "action": either "comment" or "web_search"
@@ -284,7 +311,14 @@ Meeting (provided by user):
 <<<MEETING_CONTEXT>>>
 >>>
 
-Preferred glossary (use these EXACT spellings for any matching entities in your summary):
+Preferred glossary (spelling reference only — **not** a topic list, **not** extra facts):
+- Use a glossary spelling **only** when the same entity is **already in the transcript chunk** (or
+  unambiguously implied) **and** the spoken wording is plausibly that term under typical ASR /
+  pronunciation confusion **and** the meeting title / context make the reference coherent.
+- **Do not** name people, companies, products, places, or acronyms from this list in the blurb if
+  they are not actually in the transcript or web excerpts. **Do not** invent storylines to justify a
+  glossary term. When in doubt, omit it and stick to what the chunk and sources actually say.
+
 <<<
 <<<DICTIONARY>>>
 >>>
@@ -302,6 +336,50 @@ Web excerpts (may be empty):
 >>>
 
 Rules: same primary language as the transcript; **McKinsey-style executive blurb**—**lead with the takeaway** (pyramid), then tight supporting lines only from excerpts + transcript; **at most 2 short paragraphs** OR **one** paragraph + **up to 3** tight bullets; **hard cap ~110 words** total; declarative; no JSON; no long lists."""
+
+
+MEETING_SUMMARY_TEMPLATE = """You write a **post-meeting summary** for the participants. People will read this **after** the meeting, not during it.
+
+Use the meeting title / background, the (possibly long) transcript, and the per-pass insight comments produced live. The transcript may be slightly imperfect ASR; do **not** invent facts.
+
+Meeting (provided by user):
+- Title: <<<MEETING_TITLE>>>
+- Background/context:
+<<<
+<<<MEETING_CONTEXT>>>
+>>>
+
+Preferred glossary (spelling reference only — **not** a topic list and **not** extra facts):
+- Use a glossary spelling **only** when the same entity is **already in the transcript / live insights** and the spoken wording is plausibly that term under typical ASR / pronunciation confusion **and** the meeting context makes the reference coherent.
+- **Never** introduce people, companies, products, places, or acronyms from the glossary that did not actually come up. When in doubt, omit.
+<<<
+<<<DICTIONARY>>>
+>>>
+
+Live insight comments captured during the meeting (each was produced from one transcript chunk; may be redundant or partly out of date):
+<<<
+<<<INSIGHTS>>>
+>>>
+
+Transcript:
+<<<
+<<<SNIPPET>>>
+>>>
+
+Output rules:
+- **Same primary language** as the transcript.
+- **Markdown** only — no JSON, no preamble, no closing remarks, no headers other than the two below.
+- **Exactly two top-level sections, in this order:**
+
+  ## Key takeaways
+  - 3 to 7 short bullets. Each starts with a **bold lead phrase** stating the point, then one short sentence of support grounded in the transcript / live insights. No questions, no fluff. If something is uncertain, mark it `(unconfirmed)`.
+
+  ## Next actions
+  - 2 to 7 short bullets. Each bullet is **one concrete action**: who (if known) → what → by when (if mentioned). If owner / due date is unclear, write `owner: unclear` / `due: unclear` instead of guessing. If no actions were discussed, write a single bullet: `- No explicit next actions were agreed in this meeting.`
+
+- **Hard cap ~250 words total** across both sections. No section may be empty (use the unclear / no-action fallback if needed).
+- Do **not** include long quotations from the transcript; paraphrase tightly.
+"""
 
 
 def _embed_snippet(template: str, snippet: str) -> str:
@@ -618,6 +696,111 @@ async def llm_synthesize_web_findings(
     return text
 
 
+# Hard cap on total prompt characters for the post-meeting summary call. Long meetings
+# can produce huge transcripts; we keep the most recent portion and prepend a marker so the
+# LLM understands the input was truncated. Tunable via env for users with bigger context windows.
+_MEETING_SUMMARY_TRANSCRIPT_CHAR_CAP = 24000
+_MEETING_SUMMARY_INSIGHTS_CHAR_CAP = 6000
+MEETING_SUMMARY_TRUNCATION_MARKER = "(…earlier transcript truncated for summary…)"
+MEETING_SUMMARY_INSIGHTS_TRUNCATION_MARKER = "(…earlier live insights truncated for summary…)"
+MEETING_SUMMARY_OFFLINE_MARKDOWN = (
+    "## Key takeaways\n\n"
+    "- LLM unavailable: no `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / "
+    "(`BASE_URL` + `API_KEY` + `MODEL`), or the connectivity probe failed.\n"
+    "- Configure an LLM and press **Save** again to regenerate this summary.\n\n"
+    "## Next actions\n\n"
+    "- Configure an LLM provider and re-run the meeting save to produce a real summary.\n"
+)
+
+
+def _tail_truncate(text: str, cap: int, marker: str) -> str:
+    """Keep the trailing `cap` chars of `text`; prepend `marker` if anything was dropped."""
+    body = text or ""
+    if len(body) <= cap:
+        return body
+    kept = body[-cap:]
+    return f"{marker}\n{kept}"
+
+
+def _format_insight_history(passes: list[tuple[str, str]]) -> str:
+    """`passes` is a list of (kind, body_md) tuples in chronological order.
+
+    Returns a compact markdown blob suitable to embed in MEETING_SUMMARY_TEMPLATE.
+    """
+    if not passes:
+        return "(none)"
+    lines: list[str] = []
+    for i, (kind, body) in enumerate(passes, 1):
+        body_text = (body or "").strip()
+        if not body_text:
+            continue
+        label = "Comment" if kind == "comment" else "Research summary"
+        lines.append(f"### Pass {i} — {label}\n{body_text}")
+    return "\n\n".join(lines) if lines else "(none)"
+
+
+async def llm_meeting_summary(
+    transcript_text: str,
+    *,
+    insight_passes: list[tuple[str, str]] | None = None,
+    meeting_title: str = "",
+    meeting_context: str = "",
+    dictionary_terms: "object" = (),
+) -> str:
+    """Produce a post-meeting markdown summary with **Key takeaways** and **Next actions**.
+
+    - Returns `MEETING_SUMMARY_OFFLINE_MARKDOWN` when no LLM backend is configured (so the
+      app can still write a meaningful `summary.md`).
+    - On LLM error / empty result after retries, falls back to the offline markdown plus a short
+      diagnostic line so the user knows why.
+    """
+    transcript = (transcript_text or "").strip()
+    if not transcript:
+        return (
+            "## Key takeaways\n\n"
+            "- No transcript was captured for this meeting.\n\n"
+            "## Next actions\n\n"
+            "- Capture transcript content and re-run the save to generate a summary.\n"
+        )
+
+    if not _llm_is_configured():
+        return MEETING_SUMMARY_OFFLINE_MARKDOWN
+
+    transcript_blob = _tail_truncate(
+        transcript,
+        _MEETING_SUMMARY_TRANSCRIPT_CHAR_CAP,
+        MEETING_SUMMARY_TRUNCATION_MARKER,
+    )
+    insights_blob = _format_insight_history(insight_passes or [])
+    insights_blob = _tail_truncate(
+        insights_blob,
+        _MEETING_SUMMARY_INSIGHTS_CHAR_CAP,
+        MEETING_SUMMARY_INSIGHTS_TRUNCATION_MARKER,
+    )
+    ctx = meeting_context.strip() if meeting_context else "(none)"
+
+    prompt = (
+        MEETING_SUMMARY_TEMPLATE.replace(
+            "<<<MEETING_TITLE>>>", _meeting_title_for_prompt(meeting_title)
+        )
+        .replace("<<<MEETING_CONTEXT>>>", ctx)
+        .replace("<<<DICTIONARY>>>", _dictionary_block(dictionary_terms))
+        .replace("<<<INSIGHTS>>>", insights_blob)
+        .replace("<<<SNIPPET>>>", transcript_blob)
+    )
+
+    text, err = await _llm_user_text_with_retry(prompt, 1024)
+    body = _strip_code_fence(text).strip()
+    if body:
+        return body
+    diag = (
+        "_LLM returned an empty summary after retries (transient)._"
+        if err == "empty"
+        else f"_LLM call failed after retries._\n\n```\n{err}\n```"
+    )
+    return f"{MEETING_SUMMARY_OFFLINE_MARKDOWN}\n{diag}\n"
+
+
 async def llm_keywords_and_summary(transcript_snippet: str) -> tuple[list[str], str]:
     """Return (keywords, short_summary). Uses env API keys when present."""
     snippet = transcript_snippet.strip()
@@ -774,8 +957,12 @@ def _chat_prompt(
     )
     glossary = _dictionary_block(dictionary_terms)
     glossary_line = (
-        f"Preferred glossary (use these EXACT spellings when referring to matching entities): "
-        f"{glossary}\n"
+        "Preferred glossary (canonical spellings below).\n"
+        f"The listed forms are: {glossary}.\n"
+        "Prefer these spellings only for entities **actually** present in the transcript when the "
+        "wording could be the same entity under typical ASR / pronunciation ambiguity **and** the "
+        "meeting title / context plus surrounding lines make that reading plausible. Do **NOT** "
+        "invent or emphasize glossary items that do not appear in the transcript.\n\n"
         if glossary != "(none)"
         else ""
     )

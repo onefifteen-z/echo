@@ -26,8 +26,10 @@ from echo.splash import SplashScreen
 from echo.llm import (
     InsightRouteResult,
     llm_chat_answer,
+    llm_meeting_summary,
     llm_route_insight,
     llm_synthesize_web_findings,
+    MEETING_SUMMARY_OFFLINE_MARKDOWN,
 )
 from echo.search import SearchHit, duckduckgo_search
 from echo.text_utils import format_timestamp_hms
@@ -815,6 +817,12 @@ class EchoApp(App[None]):
         self.live_min_rms = live_cfg.min_rms
         self.live_active_amp = live_cfg.active_amp
         self.live_min_active_ratio = live_cfg.min_active_ratio
+        self.live_vad_backend = live_cfg.vad_backend
+        self.live_vad_min_speech_ratio = live_cfg.vad_min_speech_ratio
+        self.live_vad_speech_prob_threshold = live_cfg.vad_speech_prob_threshold
+        self.live_vad_aggressiveness = live_cfg.vad_aggressiveness
+        self.live_denoise_backend = live_cfg.denoise_backend
+        self.live_denoise_strength = live_cfg.denoise_strength
         self.live_chunk_overlap_seconds = live_cfg.chunk_overlap_seconds
         self.live_segment_pause_seconds = live_cfg.segment_pause_seconds
         self.live_overlap_min_chars = live_cfg.overlap_min_chars
@@ -947,6 +955,20 @@ class EchoApp(App[None]):
                 f"insight_replay[min_chars={self.insight_min_chars},"
                 f"min_interval={self.insight_min_interval:.1f}s]"
             )
+        if self.live_vad_backend != "off":
+            vad_dbg = (
+                f"vad[{self.live_vad_backend},min_ratio={self.live_vad_min_speech_ratio:.2f},"
+                f"prob_thr={self.live_vad_speech_prob_threshold:.2f},"
+                f"agg={self.live_vad_aggressiveness}]"
+            )
+        else:
+            vad_dbg = "vad[off]"
+        if self.live_denoise_backend != "off":
+            denoise_dbg = (
+                f"denoise[{self.live_denoise_backend},strength={self.live_denoise_strength:.2f}]"
+            )
+        else:
+            denoise_dbg = "denoise[off]"
         self._debug_note(
             "startup "
             f"mode={mode} live={self.live_audio} stable={self.live_rewrite_stable_seconds:.1f}s "
@@ -957,6 +979,7 @@ class EchoApp(App[None]):
             f"rewrite={'on' if self.enable_transcript_rewrite else 'off'} "
             f"debug={'on' if self.debug_enabled else 'off'} "
             f"lang={self.live_asr_language} "
+            f"{vad_dbg} {denoise_dbg} "
             f"{insight_dbg}",
         )
         if self._debug_log_path is not None:
@@ -995,22 +1018,6 @@ class EchoApp(App[None]):
         if self._explicit_output_dir is None:
             self.output_dir = Path.cwd() / "output" / meeting_title_to_folder_name(self.meeting_title)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-
-    def _meeting_asr_prompt(self) -> str:
-        """Short text fed to Whisper as initial prompt to bias decoding toward meeting jargon/names.
-
-        Skips the synthetic ``untitled-meeting`` placeholder and the ``@YYYY-MM-DD`` suffix the
-        setup screen prefills so the prompt stays focused on user-meaningful content.
-        """
-        from echo.asr import build_asr_prompt
-
-        title = self.meeting_title.strip()
-        if title == _UNTITLED_MEETING:
-            title = ""
-        # Strip the auto-prefilled date stamp (e.g. "Weekly Sync @2026-05-11") — it adds no
-        # acoustic/spelling signal for the decoder.
-        title = re.sub(r"\s*@\d{4}-\d{2}-\d{2}\s*$", "", title).strip()
-        return build_asr_prompt(title, self.meeting_context, self._dictionary_terms())
 
     def _dictionary_terms(self) -> tuple[str, ...]:
         """Glossary terms loaded from ``dictionary.yml`` (mtime-cached; safe to call per chunk)."""
@@ -1184,6 +1191,70 @@ class EchoApp(App[None]):
         context_path.write_text(self._meeting_context_markdown(), encoding="utf-8")
         if show_notification:
             self.notify(f"Saved notes and insights to {self.output_dir}", timeout=4)
+        self._schedule_meeting_summary_write(show_notification=show_notification)
+
+    def _schedule_meeting_summary_write(self, *, show_notification: bool) -> None:
+        """Generate `summary.md` (Key takeaways + Next actions) via LLM in the background.
+
+        Writes a static offline-fallback file immediately when no LLM backend is configured so the
+        artifact still exists; otherwise spawns an async task that overwrites the file once the
+        LLM responds. Failures must never block save/exit.
+        """
+        summary_path = self.output_dir / "summary.md"
+        if self._llm_offline:
+            try:
+                summary_path.write_text(MEETING_SUMMARY_OFFLINE_MARKDOWN, encoding="utf-8")
+            except OSError:
+                self.log.exception("save: failed to write offline summary.md")
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None or not loop.is_running():
+            try:
+                summary_path.write_text(MEETING_SUMMARY_OFFLINE_MARKDOWN, encoding="utf-8")
+            except OSError:
+                self.log.exception("save: failed to write fallback summary.md (no loop)")
+            return
+        try:
+            summary_path.write_text(
+                "_Generating meeting summary…_\n", encoding="utf-8"
+            )
+        except OSError:
+            self.log.exception("save: failed to write summary.md placeholder")
+        asyncio.create_task(
+            self._async_write_meeting_summary(
+                summary_path, show_notification=show_notification
+            )
+        )
+
+    async def _async_write_meeting_summary(
+        self, summary_path: Path, *, show_notification: bool
+    ) -> None:
+        try:
+            transcript = "\n".join(self._lines)
+            insight_passes = [(rec.kind, rec.body_md) for rec in self._insight_passes]
+            md = await llm_meeting_summary(
+                transcript,
+                insight_passes=insight_passes,
+                meeting_title=self.meeting_title,
+                meeting_context=self.meeting_context,
+                dictionary_terms=self._dictionary_terms(),
+            )
+            summary_path.write_text(md, encoding="utf-8")
+            if show_notification:
+                self.notify(f"Meeting summary written to {summary_path}", timeout=4)
+        except Exception:  # noqa: BLE001 - never let summary failure crash the app
+            self.log.exception("save: failed to generate meeting summary")
+            try:
+                summary_path.write_text(
+                    MEETING_SUMMARY_OFFLINE_MARKDOWN
+                    + "\n_Summary generation raised an unexpected error; see app logs._\n",
+                    encoding="utf-8",
+                )
+            except OSError:
+                self.log.exception("save: failed to write fallback summary.md after error")
 
     def _meeting_context_markdown(self) -> str:
         ctx = self.meeting_context or "_(none)_"
@@ -1507,7 +1578,6 @@ class EchoApp(App[None]):
                     model_id=self.model_id,
                     chunk_seconds=self.chunk_seconds,
                     device=self.whisper_device,
-                    prompt_text=self._meeting_asr_prompt() or None,
                 ),
             )
         except RuntimeError as e:

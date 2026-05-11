@@ -1,4 +1,4 @@
-"""Glossary YAML loader + injection into ASR initial prompt and LLM prompts."""
+"""Glossary YAML loader + injection into LLM prompts."""
 
 from __future__ import annotations
 
@@ -139,32 +139,6 @@ def test_load_dictionary_pyyaml_missing_returns_empty(
     assert notes and "pyyaml" in notes[0].lower()
 
 
-def test_build_asr_prompt_appends_glossary() -> None:
-    from echo.asr import build_asr_prompt
-
-    out = build_asr_prompt(
-        "Weekly Sync", "Review blockers", terms=["EchoApp", "石井"],
-    )
-    assert "Weekly Sync" in out
-    assert "Review blockers" in out
-    assert "Glossary: EchoApp, 石井" in out
-
-
-def test_build_asr_prompt_glossary_only_when_no_title_or_context() -> None:
-    from echo.asr import build_asr_prompt
-
-    out = build_asr_prompt("", "", terms=["A", "B"])
-    assert out == "Glossary: A, B"
-
-
-def test_build_asr_prompt_respects_char_budget_with_terms() -> None:
-    import echo.asr as asr
-
-    long_terms = [f"term{i:03d}" for i in range(500)]
-    out = asr.build_asr_prompt("Title", "Ctx", terms=long_terms)
-    assert len(out) <= asr._ASR_PROMPT_CHAR_BUDGET
-
-
 def test_llm_route_insight_includes_glossary(monkeypatch: pytest.MonkeyPatch) -> None:
     import echo.llm as llm
 
@@ -193,6 +167,11 @@ def test_llm_route_insight_includes_glossary(monkeypatch: pytest.MonkeyPatch) ->
 
     prompt = captured["prompt"]
     assert "Preferred glossary" in prompt
+    assert "sprinkle glossary nouns" in prompt
+    assert "pronunciation-level similarity" in prompt
+    # comment-side hard rule: glossary terms cannot be invented in the comment body
+    assert "Glossary discipline" in prompt
+    assert "spelling reference only" in prompt
     assert "EchoApp" in prompt
     assert "石井" in prompt
     assert "FOMC" in prompt
@@ -220,9 +199,12 @@ def test_llm_synthesize_web_findings_includes_glossary(
             dictionary_terms=["EchoApp", "石井"],
         )
     )
-    assert "Preferred glossary" in captured["prompt"]
-    assert "EchoApp" in captured["prompt"]
-    assert "石井" in captured["prompt"]
+    p = captured["prompt"]
+    assert "Preferred glossary" in p
+    assert "spelling reference only" in p
+    assert "**not** a topic list" in p
+    assert "EchoApp" in p
+    assert "石井" in p
 
 
 def test_chat_prompt_includes_glossary_line() -> None:
@@ -236,6 +218,7 @@ def test_chat_prompt_includes_glossary_line() -> None:
         dictionary_terms=["EchoApp", "石井"],
     )
     assert "Preferred glossary" in out
+    assert "pronunciation ambiguity" in out
     assert "EchoApp" in out
     assert "石井" in out
 

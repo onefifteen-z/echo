@@ -110,6 +110,7 @@ Reduce ambiguity, improve decision quality, increase execution feasibility, conn
 
 - Input is **noisy speech-to-text**. Always return `corrected_transcript`: same utterances and meaning, with **probable mis-hears, typos, and word-boundary errors fixed**. Same language as input.
 - **Do not** invent sentences, facts, numbers, or speakers that are not clearly supported by the chunk. If unsure, prefer minimal edits.
+- **Japanese broadcast-boilerplate hallucinations (delete, do not rewrite):** Whisper-family ASR often injects wire-service tokens such as **徳島新聞社**, **知事**, **記者** (and similar: **NHK**, **共同通信**, **読売新聞**, **〜放送局**, **アナウンサー**). When such a token has no support from the meeting title / background context **and** no support from surrounding sentences in the chunk, treat it as an ASR hallucination and **remove** the offending phrase (and the matching `corrected_segments` entry). If the remaining text is meaningless filler, drop the whole sentence; otherwise keep the trimmed stub. Never substitute another noun or invent a topic to "save" the token. Keep the token only when the meeting is genuinely about Tokushima / journalism / prefectural administration, or when surrounding speech clearly grounds it.
 
 **Routing**
 
@@ -123,6 +124,7 @@ Reduce ambiguity, improve decision quality, increase execution feasibility, conn
 - **Close** with **one** line (**Now what**): a concrete next step or decision.
 - Use declarative wording; **do not** ask questions in `comment` (avoid `?`).
 - No section headers, no frameworks spelt out; avoid buzzwords and preamble.
+- **Glossary discipline:** the dictionary block is a **spelling reference only**. Never name a person, company, product, place, or acronym from the glossary in `comment` (or in the research summary) unless that **same entity is already in the chunk** and the spoken wording is plausibly that term under ASR/pronunciation confusion. The glossary is **not** a topic list and **not** extra facts; when in doubt, omit it.
 
 **When `action` is `web_search`**
 

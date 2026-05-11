@@ -240,13 +240,53 @@ Example `.env` at the repo root:
 
 Add `.env` to `.gitignore` (already in this repo) so keys are not committed.
 
+### VAD and denoising
+
+The live pipeline ships with an energy-only voice gate by default. For noisier rooms (HVAC,
+keyboard, music bleed) you can opt into a real **VAD** model and a spectral **denoiser** in
+front of Whisper. Both stages live in `echo/audio_filters.py`, are off by default, and
+fail safely (missing dep -> single warning, fall back to passthrough) so disabling them is
+just a matter of unsetting the env var.
+
+Install the optional extra:
+
+```bash
+pip install -e '.[asr,asr-vad]'
+```
+
+Recommended starting config (Silero VAD + spectral gating):
+
+```bash
+ECHO_LIVE_VAD=silero \
+ECHO_LIVE_VAD_MIN_SPEECH_RATIO=0.10 \
+ECHO_LIVE_DENOISE=noisereduce \
+echo-tui --live
+```
+
+| Env var | Default | Notes |
+|---|---|---|
+| `ECHO_LIVE_VAD` | `off` | `silero`, `webrtc`, or `off`. `silero` automatically falls back to `webrtc` if the model can't load, then to `off`. |
+| `ECHO_LIVE_VAD_MIN_SPEECH_RATIO` | `0.10` | Drop a chunk when fewer than this fraction of frames are classified as speech (0..1). |
+| `ECHO_LIVE_VAD_SPEECH_PROB_THRESHOLD` | `0.5` | Per-frame Silero probability cutoff (0..1). |
+| `ECHO_LIVE_VAD_AGGRESSIVENESS` | `2` | WebRTC mode 0..3 (higher = stricter). |
+| `ECHO_LIVE_DENOISE` | `off` | `noisereduce` or `off` (stationary spectral gating). |
+| `ECHO_LIVE_DENOISE_STRENGTH` | `0.85` | `prop_decrease` for `noisereduce` (0..1). |
+
+The energy gate (`ECHO_LIVE_MIN_RMS` / `ECHO_LIVE_ACTIVE_AMP`) still runs first as a cheap
+pre-filter; the model VAD only sees chunks that already passed it. Rejections show up as
+`VAD gate` in the input meter note and as `vad drop ratio=...` lines in the debug log.
+
+**Heads up:** aggressive denoising can *hurt* Whisper accuracy on already-clean audio
+(it can over-suppress voiced fricatives). Leave `ECHO_LIVE_DENOISE=off` unless background
+noise is a concrete problem, and start with a low strength (`0.4`-`0.6`) before pushing it
+higher.
+
 ### Glossary / dictionary
 
 Drop a `dictionary.yml` at the repo root (or set `ECHO_DICTIONARY_PATH=/abs/path.yml`) to bias
-both the **Whisper ASR initial prompt** and **all LLM prompts** (transcript correction, web
-synthesis, chat) toward your preferred spellings of proper nouns, jargon, names, and acronyms.
-Whisper biases decoding *before* mistakes happen; the LLM substitutes the canonical spelling
-when the transcript clearly refers to a glossary entry.
+**LLM prompts** (transcript correction, web synthesis, chat) toward your preferred spellings of
+proper nouns, jargon, names, and acronyms. The LLM substitutes the canonical spelling when the
+transcript clearly refers to a glossary entry.
 
 The file is mtime-cached, so live edits are picked up without restarting Echo. A starter file
 ships at `dictionary.yml.example` — copy it to `dictionary.yml` (gitignored). All three shapes
@@ -276,16 +316,33 @@ acronyms: [FOMC, ARPU]
 ```
 
 Missing file = feature off (no warnings). Missing PyYAML = one-time hint in the debug log;
-ASR / LLM continue normally without the glossary.
+LLM calls continue normally without the glossary.
 
 ### Keyboard shortcuts
 
 | Key | Action |
 |-----|--------|
 | `p` | Pause / resume (text replay or between ASR chunks). |
-| `s` | Save current transcript to `echo_transcript_<timestamp>.txt` in the working directory. |
+| `s` | Save the meeting bundle to the per-meeting output directory (see below). |
 | `c` | Clear chat log. |
 | `q` | Quit. |
+
+### Save output (`s`)
+
+Pressing `s` writes the current meeting to its output directory:
+
+| File | Contents |
+|------|----------|
+| `notes.txt` | Plain-text transcript (one line per utterance). |
+| `insights.md` | All live insight passes (comments + research summaries + web hits). |
+| `meeting_context.md` | Meeting title and the background context entered at start. |
+| `summary.md` | **LLM-generated post-meeting summary** with two sections — `## Key takeaways` and `## Next actions`. |
+
+`summary.md` is rendered by the configured LLM using the transcript, the live insight comments,
+the meeting title / context, and the optional glossary. While the LLM call is in flight the file
+contains a `_Generating meeting summary…_` placeholder, then is overwritten when the response
+arrives. If no LLM provider is configured (or the call fails), `summary.md` falls back to a static
+markdown stub explaining how to enable it.
 
 ## Project layout
 
@@ -297,9 +354,10 @@ echo/
   live_audio.py # sounddevice capture (mic + optional loopback)
   macos/SystemAudioCapture.swift  # bundled ScreenCaptureKit helper for --live-system-authorized
   asr.py        # Kotoba-Whisper weights, chunked inference
+  audio_filters.py  # Optional VAD (Silero/WebRTC) + denoise (noisereduce)
   llm.py        # Optional Anthropic / OpenAI + fallbacks
   search.py     # DuckDuckGo (threaded)
-  dictionary.py # Optional glossary loader (dictionary.yml -> ASR + LLM prompts)
+  dictionary.py # Optional glossary loader (dictionary.yml -> LLM prompts)
 samples/
   sample_transcript.txt
 dictionary.yml.example

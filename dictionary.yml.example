@@ -1,8 +1,9 @@
 # Echo glossary - copy to `dictionary.yml` (auto-discovered) or set ECHO_DICTIONARY_PATH.
 #
-# Terms listed here are biased into both the Whisper ASR initial prompt (so the decoder prefers
-# these spellings) and the LLM transcript-correction / synthesis / chat prompts (so the model
-# substitutes the canonical form when the transcript clearly refers to one of them).
+# Terms listed here are injected into LLM transcript-correction / synthesis / chat prompts as
+# spelling hints only. The model is instructed to use a canonical form when the spoken fragment is
+# plausibly the same word under ASR/pronunciation ambiguity AND the meeting context makes the
+# reference sensible — not to sprinkle glossary nouns where they do not belong.
 #
 # Three equivalent shapes - pick whichever you find easiest to maintain. They all flatten to
 # the same deduped list. Keep the file short (~200 terms / 600 chars when joined) so prompts
