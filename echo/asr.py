@@ -15,6 +15,7 @@ from echo.text_utils import format_timestamp_hms
 __all__ = [
     "MODEL_ID_DEFAULT",
     "TranscribeSession",
+    "build_asr_prompt",
     "ensure_model_loaded",
     "format_timestamp_hms",
     "get_last_model_load_source",
@@ -41,6 +42,15 @@ _lock = threading.Lock()
 _state: _LoadedAsr | None = None
 _runtime_configured = False
 _hf_http_configured = False
+
+# Whisper's decoder budget for a prompt is roughly half of ``max_target_positions``; leave a little
+# headroom so the actual transcription has room to grow. Tokens beyond this are trimmed from the
+# *front* (older context) so the most recent meeting framing wins.
+_ASR_PROMPT_TOKEN_BUDGET = 223
+# Conservative character cap before tokenization. Even very dense scripts (CJK) stay well under
+# the token budget at this length.
+_ASR_PROMPT_CHAR_BUDGET = 600
+_prompt_ids_cache: dict[tuple[str, str], object] = {}
 
 
 def _configure_runtime_once() -> None:
@@ -352,12 +362,77 @@ def _load_audio_mono_16k(path: Path):
             ) from e2
 
 
+def build_asr_prompt(
+    title: str,
+    context: str,
+    terms: "object" = (),
+) -> str:
+    """Combine meeting title + context + glossary terms into a single Whisper initial prompt.
+
+    ``terms`` is any iterable of strings (typically loaded from ``echo.dictionary``); when
+    non-empty it is appended as ``" Glossary: A, B, C"``. The whole string is trimmed to
+    ``_ASR_PROMPT_CHAR_BUDGET`` characters so we stay comfortably under Whisper's decoder
+    prompt budget regardless of script density.
+    """
+    parts = [p.strip() for p in (title, context) if p and p.strip()]
+    body = " ".join(parts)
+    body = " ".join(body.split())
+
+    glossary_terms = [str(t).strip() for t in (terms or ()) if str(t).strip()]
+    if glossary_terms:
+        glossary = "Glossary: " + ", ".join(glossary_terms)
+        text = f"{body} {glossary}".strip() if body else glossary
+    else:
+        text = body
+
+    if not text:
+        return ""
+    if len(text) > _ASR_PROMPT_CHAR_BUDGET:
+        text = text[:_ASR_PROMPT_CHAR_BUDGET].rstrip()
+    return text
+
+
+def _compute_prompt_ids(state: "_LoadedAsr", prompt_text: str) -> object | None:
+    """Tokenize ``prompt_text`` for Whisper, capped to ``_ASR_PROMPT_TOKEN_BUDGET`` tokens.
+
+    Returns ``None`` if the processor does not expose ``get_prompt_ids`` (older transformers)
+    or tokenization fails — callers fall back to the plain decoder path in that case.
+    """
+    text = prompt_text.strip()
+    if not text:
+        return None
+    cache_key = (state.model_id, text)
+    cached = _prompt_ids_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    get_prompt_ids = getattr(state.processor, "get_prompt_ids", None)
+    if get_prompt_ids is None:
+        return None
+    try:
+        import torch
+
+        ids = get_prompt_ids(text, return_tensors="pt")
+        if hasattr(ids, "dim") and ids.dim() == 1:
+            ids = ids.unsqueeze(0)
+        if hasattr(ids, "shape") and ids.shape[-1] > _ASR_PROMPT_TOKEN_BUDGET:
+            ids = ids[..., -_ASR_PROMPT_TOKEN_BUDGET:]
+        ids = ids.to(state.device) if hasattr(ids, "to") else ids
+        if isinstance(ids, torch.Tensor) and ids.dim() == 2 and ids.shape[0] == 1:
+            ids = ids[0]
+    except Exception:  # noqa: BLE001 - prompt is a best-effort calibration hint
+        return None
+    _prompt_ids_cache[cache_key] = ids
+    return ids
+
+
 def transcribe_mono16k_chunk(
     samples: "object",
     *,
     model_id: str = MODEL_ID_DEFAULT,
     device: str | None = None,
     language: str = "japanese",
+    prompt_text: str | None = None,
 ) -> str:
     """Decode one mono float32 chunk at 16 kHz (Whisper). Returns empty string if too short."""
     import numpy as np
@@ -383,14 +458,18 @@ def transcribe_mono16k_chunk(
     inputs = state.processor(x, sampling_rate=16000, return_tensors="pt")
     feats = inputs.input_features.to(state.device, dtype=state.dtype)
     attn_mask = torch.ones(feats.shape[:-1], dtype=torch.long, device=state.device)
+    gen_kwargs: dict[str, object] = {
+        "attention_mask": attn_mask,
+        "language": language,
+        "task": "transcribe",
+        "max_length": state.max_length,
+    }
+    if prompt_text:
+        prompt_ids = _compute_prompt_ids(state, prompt_text)
+        if prompt_ids is not None:
+            gen_kwargs["prompt_ids"] = prompt_ids
     with torch.inference_mode():
-        pred_ids = state.model.generate(
-            feats,
-            attention_mask=attn_mask,
-            language=language,
-            task="transcribe",
-            max_length=state.max_length,
-        )
+        pred_ids = state.model.generate(feats, **gen_kwargs)
     return state.processor.batch_decode(pred_ids, skip_special_tokens=True)[0].strip()
 
 
@@ -404,11 +483,13 @@ class TranscribeSession:
         model_id: str = MODEL_ID_DEFAULT,
         chunk_seconds: float = 30.0,
         device: str | None = None,
+        prompt_text: str | None = None,
     ) -> None:
         _require_asr_deps()
         self._model_id = model_id
         self._chunk_seconds = chunk_seconds
         self._device = device
+        self._prompt_text = (prompt_text or "").strip() or None
         self._audio, self._sr = _load_audio_mono_16k(path)
         if self._sr != 16000:
             raise RuntimeError("internal resample error")
@@ -430,6 +511,7 @@ class TranscribeSession:
             model_id=self._model_id,
             device=self._device,
             language="japanese",
+            prompt_text=self._prompt_text,
         )
         self._index += 1
         return (start / self._sr, end / self._sr, text)

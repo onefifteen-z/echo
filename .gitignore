@@ -11,3 +11,5 @@ __pycache__/
 echo_transcript_*.txt
 log/
 .DS_Store
+dictionary.yml
+!dictionary.yml.example

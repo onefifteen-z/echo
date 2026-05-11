@@ -996,6 +996,28 @@ class EchoApp(App[None]):
             self.output_dir = Path.cwd() / "output" / meeting_title_to_folder_name(self.meeting_title)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+    def _meeting_asr_prompt(self) -> str:
+        """Short text fed to Whisper as initial prompt to bias decoding toward meeting jargon/names.
+
+        Skips the synthetic ``untitled-meeting`` placeholder and the ``@YYYY-MM-DD`` suffix the
+        setup screen prefills so the prompt stays focused on user-meaningful content.
+        """
+        from echo.asr import build_asr_prompt
+
+        title = self.meeting_title.strip()
+        if title == _UNTITLED_MEETING:
+            title = ""
+        # Strip the auto-prefilled date stamp (e.g. "Weekly Sync @2026-05-11") — it adds no
+        # acoustic/spelling signal for the decoder.
+        title = re.sub(r"\s*@\d{4}-\d{2}-\d{2}\s*$", "", title).strip()
+        return build_asr_prompt(title, self.meeting_context, self._dictionary_terms())
+
+    def _dictionary_terms(self) -> tuple[str, ...]:
+        """Glossary terms loaded from ``dictionary.yml`` (mtime-cached; safe to call per chunk)."""
+        from echo.dictionary import load_dictionary
+
+        return load_dictionary(notify=self._debug_note)
+
     def _start_workers(self) -> None:
         if self._workers_started:
             return
@@ -1485,6 +1507,7 @@ class EchoApp(App[None]):
                     model_id=self.model_id,
                     chunk_seconds=self.chunk_seconds,
                     device=self.whisper_device,
+                    prompt_text=self._meeting_asr_prompt() or None,
                 ),
             )
         except RuntimeError as e:
@@ -1889,7 +1912,13 @@ class EchoApp(App[None]):
                             f"insight pass input segments={len(seg_payload)} ids={first_id}-{last_id}",
                         )
                     route = await asyncio.wait_for(
-                        llm_route_insight(snapshot, segments=seg_payload, meeting_context=self.meeting_context),
+                        llm_route_insight(
+                            snapshot,
+                            segments=seg_payload,
+                            meeting_context=self.meeting_context,
+                            meeting_title=self.meeting_title,
+                            dictionary_terms=self._dictionary_terms(),
+                        ),
                         timeout=llm_timeout,
                     )
                     if _is_stale():
@@ -1976,7 +2005,14 @@ class EchoApp(App[None]):
                             ddg_err = f"ddgs: `{e!s}`"
                     try:
                         summary = await asyncio.wait_for(
-                            llm_synthesize_web_findings(ctx, query, hits, self.meeting_context),
+                            llm_synthesize_web_findings(
+                                ctx,
+                                query,
+                                hits,
+                                self.meeting_context,
+                                meeting_title=self.meeting_title,
+                                dictionary_terms=self._dictionary_terms(),
+                            ),
                             timeout=llm_timeout,
                         )
                     except asyncio.TimeoutError:
@@ -2050,7 +2086,13 @@ class EchoApp(App[None]):
         else:
             full = "\n".join(lines)
         try:
-            ans = await llm_chat_answer(full, q, self.meeting_context)
+            ans = await llm_chat_answer(
+                full,
+                q,
+                self.meeting_context,
+                meeting_title=self.meeting_title,
+                dictionary_terms=self._dictionary_terms(),
+            )
         except Exception as e:  # noqa: BLE001 — demo surface errors in UI
             ans = f"(error) {e!s}"
         chat.write(f"[bold green]AI:[/] {ans}")

@@ -676,6 +676,7 @@ class LiveTranscriptionSession:
                     model_id=app.model_id,
                     device=app.whisper_device,
                     language=app.live_asr_language or self._lang,
+                    prompt_text=app._meeting_asr_prompt() or None,
                 )
                 asr_t1 = time.monotonic()
             except Exception as e:  # noqa: BLE001

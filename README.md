@@ -240,6 +240,44 @@ Example `.env` at the repo root:
 
 Add `.env` to `.gitignore` (already in this repo) so keys are not committed.
 
+### Glossary / dictionary
+
+Drop a `dictionary.yml` at the repo root (or set `ECHO_DICTIONARY_PATH=/abs/path.yml`) to bias
+both the **Whisper ASR initial prompt** and **all LLM prompts** (transcript correction, web
+synthesis, chat) toward your preferred spellings of proper nouns, jargon, names, and acronyms.
+Whisper biases decoding *before* mistakes happen; the LLM substitutes the canonical spelling
+when the transcript clearly refers to a glossary entry.
+
+The file is mtime-cached, so live edits are picked up without restarting Echo. A starter file
+ships at `dictionary.yml.example` — copy it to `dictionary.yml` (gitignored). All three shapes
+below are equivalent and flatten to the same deduped list (capped at ~200 terms / 600 chars
+when serialized into prompts):
+
+```yaml
+# Form 1 - bare list
+- EchoApp
+- Kotoba-Whisper
+- 石井
+- FOMC
+```
+
+```yaml
+# Form 2 - explicit `terms` key
+terms:
+  - EchoApp
+  - 石井
+```
+
+```yaml
+# Form 3 - cosmetic groupings
+people: [石井, 田中]
+products: [EchoApp, EchoHub]
+acronyms: [FOMC, ARPU]
+```
+
+Missing file = feature off (no warnings). Missing PyYAML = one-time hint in the debug log;
+ASR / LLM continue normally without the glossary.
+
 ### Keyboard shortcuts
 
 | Key | Action |
@@ -261,8 +299,10 @@ echo/
   asr.py        # Kotoba-Whisper weights, chunked inference
   llm.py        # Optional Anthropic / OpenAI + fallbacks
   search.py     # DuckDuckGo (threaded)
+  dictionary.py # Optional glossary loader (dictionary.yml -> ASR + LLM prompts)
 samples/
   sample_transcript.txt
+dictionary.yml.example
 pyproject.toml
 ```
 

@@ -60,16 +60,37 @@ def _agent_digest_for_prompt() -> str:
     return digest
 
 
+def _meeting_title_for_prompt(meeting_title: str) -> str:
+    """Normalize meeting title for prompt embedding (drop placeholder + trailing date stamp)."""
+    title = (meeting_title or "").strip()
+    if not title or title == "untitled-meeting":
+        return "(none)"
+    title = re.sub(r"\s*@\d{4}-\d{2}-\d{2}\s*$", "", title).strip()
+    return title or "(none)"
+
+
+def _dictionary_block(dictionary_terms: "object") -> str:
+    """Format glossary terms as a single comma-joined line (token-cheap). Empty -> '(none)'."""
+    if not dictionary_terms:
+        return "(none)"
+    cleaned = [str(t).strip() for t in dictionary_terms if str(t).strip()]
+    return ", ".join(cleaned) if cleaned else "(none)"
+
+
 def _build_insight_route_prompt(
     snippet: str,
     *,
     segments: list[tuple[int, str]] | None = None,
+    meeting_title: str = "",
     meeting_context: str = "",
+    dictionary_terms: "object" = (),
 ) -> str:
     agent = _agent_digest_for_prompt()
     core = INSIGHT_ROUTE_CORE.replace("<<<AGENT>>>", agent.strip())
     ctx_block = meeting_context.strip() if meeting_context else "(none)"
     core = core.replace("<<<MEETING_CONTEXT>>>", ctx_block)
+    core = core.replace("<<<MEETING_TITLE>>>", _meeting_title_for_prompt(meeting_title))
+    core = core.replace("<<<DICTIONARY>>>", _dictionary_block(dictionary_terms))
     prompt = _embed_snippet(core, snippet)
     if not segments:
         return prompt.replace("<<<SEGMENTS>>>", "(none)")
@@ -211,9 +232,17 @@ INSIGHT_ROUTE_CORE = f"""{INSIGHT_COMMENT_STYLE_RULES}
 
 You route one meeting **transcript chunk** (may be imperfect ASR). Apply the digest above for transcript cleanup and for routing; for `comment` body text, **always** apply the **McKinsey-style rules** block at the very top of this prompt (even if the digest repeats similar ideas).
 
-Meeting background/context (provided by user):
+Meeting (provided by user):
+- Title: <<<MEETING_TITLE>>>
+- Background/context:
 <<<
 <<<MEETING_CONTEXT>>>
+>>>
+
+Preferred glossary (use these EXACT spellings whenever the transcript clearly refers to one of
+them; do NOT inject these terms where they do not fit acoustically/semantically):
+<<<
+<<<DICTIONARY>>>
 >>>
 
 Return ONLY valid JSON (no markdown code fences) with exactly these keys:
@@ -248,9 +277,16 @@ The transcript chunk may already be ASR-corrected (cleaned wording, same facts).
 Use the transcript chunk for context, the search query, and the web excerpts.
 If sources are empty or weak, say so in one line and lean on the transcript only.
 
-Meeting background/context (provided by user):
+Meeting (provided by user):
+- Title: <<<MEETING_TITLE>>>
+- Background/context:
 <<<
 <<<MEETING_CONTEXT>>>
+>>>
+
+Preferred glossary (use these EXACT spellings for any matching entities in your summary):
+<<<
+<<<DICTIONARY>>>
 >>>
 
 Transcript chunk:
@@ -273,11 +309,19 @@ def _embed_snippet(template: str, snippet: str) -> str:
 
 
 def _embed_synth(
-    template: str, snippet: str, query: str, sources: str, meeting_context: str = "",
+    template: str,
+    snippet: str,
+    query: str,
+    sources: str,
+    meeting_context: str = "",
+    meeting_title: str = "",
+    dictionary_terms: "object" = (),
 ) -> str:
     ctx = meeting_context.strip() if meeting_context else "(none)"
     return (
-        template.replace("<<<MEETING_CONTEXT>>>", ctx)
+        template.replace("<<<MEETING_TITLE>>>", _meeting_title_for_prompt(meeting_title))
+        .replace("<<<MEETING_CONTEXT>>>", ctx)
+        .replace("<<<DICTIONARY>>>", _dictionary_block(dictionary_terms))
         .replace("<<<SNIPPET>>>", snippet)
         .replace("<<<QUERY>>>", query)
         .replace("<<<SOURCES>>>", sources)
@@ -451,13 +495,21 @@ async def llm_route_insight(
     *,
     segments: list[tuple[int, str]] | None = None,
     meeting_context: str = "",
+    meeting_title: str = "",
+    dictionary_terms: "object" = (),
 ) -> InsightRouteResult:
     """Ask LLM to choose comment-only vs web_search. Without API keys, returns a comment explaining missing config."""
     snippet = transcript_snippet.strip()
     if not snippet:
         return InsightRouteResult("comment", "", "", "", "")
 
-    prompt = _build_insight_route_prompt(snippet, segments=segments, meeting_context=meeting_context)
+    prompt = _build_insight_route_prompt(
+        snippet,
+        segments=segments,
+        meeting_context=meeting_context,
+        meeting_title=meeting_title,
+        dictionary_terms=dictionary_terms,
+    )
     raw, err = await _llm_user_text_with_retry(prompt, 768)
     if not raw.strip():
         if not _llm_is_configured():
@@ -535,11 +587,21 @@ async def llm_synthesize_web_findings(
     query: str,
     hits: list[SearchHit],
     meeting_context: str = "",
+    meeting_title: str = "",
+    dictionary_terms: "object" = (),
 ) -> str:
     """Turn transcript + search hits into a short narrative summary."""
     snippet = transcript_snippet.strip()
     sources = _hits_bullets(hits)
-    prompt = _embed_synth(INSIGHT_SYNTH_TEMPLATE, snippet, query.strip(), sources, meeting_context)
+    prompt = _embed_synth(
+        INSIGHT_SYNTH_TEMPLATE,
+        snippet,
+        query.strip(),
+        sources,
+        meeting_context,
+        meeting_title,
+        dictionary_terms,
+    )
     text, err = await _llm_user_text_with_retry(prompt, 512)
     if not text.strip():
         if not _llm_is_configured():
@@ -578,14 +640,39 @@ async def llm_keywords_and_summary(transcript_snippet: str) -> tuple[list[str], 
 
 
 async def llm_chat_answer(
-    full_transcript: str, question: str, meeting_context: str = "",
+    full_transcript: str,
+    question: str,
+    meeting_context: str = "",
+    meeting_title: str = "",
+    dictionary_terms: "object" = (),
 ) -> str:
     if key := os.environ.get("ANTHROPIC_API_KEY"):
-        return await _anthropic_chat(key, full_transcript, question, meeting_context)
+        return await _anthropic_chat(
+            key,
+            full_transcript,
+            question,
+            meeting_context,
+            meeting_title,
+            dictionary_terms,
+        )
     if cfg := _litellm_openai_config():
-        return await _openai_compatible_chat(cfg, full_transcript, question, meeting_context)
+        return await _openai_compatible_chat(
+            cfg,
+            full_transcript,
+            question,
+            meeting_context,
+            meeting_title,
+            dictionary_terms,
+        )
     if key := os.environ.get("OPENAI_API_KEY"):
-        return await _openai_chat(key, full_transcript, question, meeting_context)
+        return await _openai_chat(
+            key,
+            full_transcript,
+            question,
+            meeting_context,
+            meeting_title,
+            dictionary_terms,
+        )
     return (
         "No API key detected. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, "
         "or LiteLLM-style BASE_URL + API_KEY + MODEL.\n"
@@ -671,17 +758,44 @@ def _parse_kw_summary(text: str) -> tuple[list[str], str]:
         return extract_keywords_fallback(raw), raw[:400]
 
 
-def _chat_prompt(full_transcript: str, question: str, meeting_context: str = "") -> str:
-    ctx = f"Meeting background/context:\n{meeting_context.strip()}\n\n" if meeting_context.strip() else ""
+def _chat_prompt(
+    full_transcript: str,
+    question: str,
+    meeting_context: str = "",
+    meeting_title: str = "",
+    dictionary_terms: "object" = (),
+) -> str:
+    title = _meeting_title_for_prompt(meeting_title)
+    title_line = f"Meeting title: {title}\n" if title != "(none)" else ""
+    ctx = (
+        f"Meeting background/context:\n{meeting_context.strip()}\n\n"
+        if meeting_context.strip()
+        else ""
+    )
+    glossary = _dictionary_block(dictionary_terms)
+    glossary_line = (
+        f"Preferred glossary (use these EXACT spellings when referring to matching entities): "
+        f"{glossary}\n"
+        if glossary != "(none)"
+        else ""
+    )
+    header = f"{title_line}{glossary_line}{ctx}" if (title_line or glossary_line or ctx) else ""
+    if header and not header.endswith("\n\n"):
+        header = header.rstrip() + "\n\n"
     return (
         "You answer questions about a meeting using the transcript as context.\n"
         "Be concise. If unknown, say you do not know.\n\n"
-        f"{ctx}Transcript:\n{full_transcript}\n\nQuestion:\n{question}"
+        f"{header}Transcript:\n{full_transcript}\n\nQuestion:\n{question}"
     )
 
 
 async def _anthropic_chat(
-    api_key: str, full_transcript: str, question: str, meeting_context: str = "",
+    api_key: str,
+    full_transcript: str,
+    question: str,
+    meeting_context: str = "",
+    meeting_title: str = "",
+    dictionary_terms: "object" = (),
 ) -> str:
     client = _get_anthropic_client(api_key)
     msg = await client.messages.create(
@@ -690,7 +804,13 @@ async def _anthropic_chat(
         messages=[
             {
                 "role": "user",
-                "content": _chat_prompt(full_transcript, question, meeting_context),
+                "content": _chat_prompt(
+                    full_transcript,
+                    question,
+                    meeting_context,
+                    meeting_title,
+                    dictionary_terms,
+                ),
             }
         ],
     )
@@ -702,6 +822,8 @@ async def _openai_compatible_chat(
     full_transcript: str,
     question: str,
     meeting_context: str = "",
+    meeting_title: str = "",
+    dictionary_terms: "object" = (),
 ) -> str:
     base_url, api_key, model = cfg
     return await _openai_chat_completions(
@@ -710,7 +832,13 @@ async def _openai_compatible_chat(
         [
             {
                 "role": "user",
-                "content": _chat_prompt(full_transcript, question, meeting_context),
+                "content": _chat_prompt(
+                    full_transcript,
+                    question,
+                    meeting_context,
+                    meeting_title,
+                    dictionary_terms,
+                ),
             }
         ],
         1024,
@@ -719,7 +847,12 @@ async def _openai_compatible_chat(
 
 
 async def _openai_chat(
-    api_key: str, full_transcript: str, question: str, meeting_context: str = "",
+    api_key: str,
+    full_transcript: str,
+    question: str,
+    meeting_context: str = "",
+    meeting_title: str = "",
+    dictionary_terms: "object" = (),
 ) -> str:
     model = os.environ.get("ECHO_OPENAI_MODEL", "gpt-4o-mini")
     return await _openai_chat_completions(
@@ -728,7 +861,13 @@ async def _openai_chat(
         [
             {
                 "role": "user",
-                "content": _chat_prompt(full_transcript, question, meeting_context),
+                "content": _chat_prompt(
+                    full_transcript,
+                    question,
+                    meeting_context,
+                    meeting_title,
+                    dictionary_terms,
+                ),
             }
         ],
         1024,
