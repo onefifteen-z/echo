@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -134,6 +135,17 @@ def configured_llm_label() -> str:
     if os.environ.get("OPENAI_API_KEY"):
         return "openai"
     return "none"
+
+
+def _llm_is_configured() -> bool:
+    """True when at least one LLM backend has the env vars `_llm_user_text` needs."""
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return True
+    if _litellm_openai_config():
+        return True
+    if os.environ.get("OPENAI_API_KEY"):
+        return True
+    return False
 
 
 def _litellm_openai_config() -> tuple[str, str, str] | None:
@@ -297,6 +309,50 @@ async def _llm_user_text(content: str, max_tokens: int) -> str:
     return ""
 
 
+# Three attempts (1 initial + 2 retries). Providers occasionally return an empty body
+# (content filter, transient 200-with-empty-body via proxy, momentary 5xx, etc.); a small
+# retry budget recovers most of these without spamming the API.
+_LLM_USER_TEXT_ATTEMPTS = 3
+# Short backoff so a stuck attempt does not delay the user noticeably; doubled per retry.
+_LLM_USER_TEXT_BACKOFF_S = 0.4
+
+
+async def _llm_user_text_with_retry(
+    content: str,
+    max_tokens: int,
+    *,
+    attempts: int = _LLM_USER_TEXT_ATTEMPTS,
+) -> tuple[str, str | None]:
+    """Call `_llm_user_text` with retries.
+
+    Returns `(text, error)`:
+    - `(non_empty_text, None)` on success.
+    - `("", "empty")` if every attempt returned empty.
+    - `("", "<exception repr>")` if every attempt raised (last exception wins).
+    Mixed cases (some raised, some empty) report `"empty"` if the final attempt was empty,
+    otherwise the final exception string.
+    """
+    # When no backend is configured, ``_llm_user_text`` deterministically returns "".
+    # Skip retries+backoff in that case so callers can render the "not configured" message
+    # immediately rather than wait through the full backoff schedule.
+    skip_retries_on_empty = not _llm_is_configured()
+    last_error: str | None = None
+    for i in range(max(1, attempts)):
+        try:
+            text = await _llm_user_text(content, max_tokens)
+        except Exception as e:  # noqa: BLE001 - surface any backend error uniformly
+            last_error = repr(e)
+        else:
+            if text and text.strip():
+                return text, None
+            last_error = "empty"
+            if skip_retries_on_empty:
+                break
+        if i < attempts - 1:
+            await asyncio.sleep(_LLM_USER_TEXT_BACKOFF_S * (2**i))
+    return "", last_error or "empty"
+
+
 async def _anthropic_user_text(api_key: str, content: str, max_tokens: int) -> str:
     client = _get_anthropic_client(api_key)
     msg = await client.messages.create(
@@ -402,14 +458,31 @@ async def llm_route_insight(
         return InsightRouteResult("comment", "", "", "", "")
 
     prompt = _build_insight_route_prompt(snippet, segments=segments, meeting_context=meeting_context)
-    raw = await _llm_user_text(prompt, 768)
+    raw, err = await _llm_user_text_with_retry(prompt, 768)
     if not raw.strip():
+        if not _llm_is_configured():
+            comment = (
+                "(LLM not configured: set ANTHROPIC_API_KEY, OPENAI_API_KEY, "
+                "or BASE_URL + API_KEY + MODEL; routing between comment and web search is disabled.)"
+            )
+            reason = "no_llm"
+        elif err == "empty":
+            comment = (
+                "_LLM returned an empty response after retries (transient; will retry on next "
+                "insight tick)._"
+            )
+            reason = "empty_response"
+        else:
+            comment = (
+                "_LLM call failed after retries (transient network/provider error; will retry "
+                f"on next insight tick)._\n\n```\n{err}\n```"
+            )
+            reason = "transient_error"
         return InsightRouteResult(
             "comment",
-            "(LLM not configured: set ANTHROPIC_API_KEY, OPENAI_API_KEY, "
-            "or BASE_URL + API_KEY + MODEL; routing between comment and web search is disabled.)",
+            comment,
             "",
-            "no_llm",
+            reason,
             snippet,
             [],
         )
@@ -467,12 +540,19 @@ async def llm_synthesize_web_findings(
     snippet = transcript_snippet.strip()
     sources = _hits_bullets(hits)
     prompt = _embed_synth(INSIGHT_SYNTH_TEMPLATE, snippet, query.strip(), sources, meeting_context)
-    text = await _llm_user_text(prompt, 512)
+    text, err = await _llm_user_text_with_retry(prompt, 512)
     if not text.strip():
-        return (
-            "_(No summary text returned by LLM; check configuration or retry. Search excerpts below.)_\n\n"
-            f"**Query:** `{query}`\n\n{_hits_bullets(hits)}"
-        )
+        if not _llm_is_configured():
+            preface = "_LLM not configured; showing raw search excerpts._"
+        elif err == "empty":
+            preface = "_LLM returned an empty summary after retries (transient). Search excerpts below._"
+        else:
+            preface = (
+                "_LLM call failed after retries (transient network/provider error). "
+                "Search excerpts below._\n\n"
+                f"```\n{err}\n```"
+            )
+        return f"{preface}\n\n**Query:** `{query}`\n\n{_hits_bullets(hits)}"
     return text
 
 
