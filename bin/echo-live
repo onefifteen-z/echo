@@ -5,4 +5,5 @@ set -euo pipefail
 ECHO_DEBUG="${ECHO_DEBUG:-0}" \
 ECHO_LIVE_CHUNK_OVERLAP_SECONDS="${ECHO_LIVE_CHUNK_OVERLAP_SECONDS:-0.3}" \
 exec echo-tui --live --live-system-authorized --whisper-device mps \
-  --model-id openai/whisper-small "$@"
+   --model-id kotoba-tech/kotoba-whisper-v2.2 "$@"
+#  --model-id openai/whisper-small "$@"

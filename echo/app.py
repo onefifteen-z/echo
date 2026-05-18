@@ -628,7 +628,7 @@ class EchoApp(App[None]):
         layout: vertical;
     }
     #input_meter {
-        height: 11;
+        height: auto;
         min-height: 11;
         border: tall $warning;
         margin: 0 1 1 0;

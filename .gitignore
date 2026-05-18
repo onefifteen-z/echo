@@ -11,5 +11,6 @@ __pycache__/
 echo_transcript_*.txt
 log/
 .DS_Store
+.obsidian/
 dictionary.yml
 !dictionary.yml.example
