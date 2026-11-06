@@ -340,7 +340,7 @@ Rules: same primary language as the transcript; **McKinsey-style executive blurb
 
 MEETING_SUMMARY_TEMPLATE = """You write a **post-meeting summary** for the participants. People will read this **after** the meeting, not during it.
 
-Use the meeting title / background, the (possibly long) transcript, and the per-pass insight comments produced live. The transcript may be slightly imperfect ASR; do **not** invent facts.
+Use the meeting title / background, the participant's own notebook, the (possibly long) transcript, and the per-pass insight comments produced live. The transcript may be slightly imperfect ASR; do **not** invent facts.
 
 Meeting (provided by user):
 - Title: <<<MEETING_TITLE>>>
@@ -354,6 +354,11 @@ Preferred glossary (spelling reference only — **not** a topic list and **not**
 - **Never** introduce people, companies, products, places, or acronyms from the glossary that did not actually come up. When in doubt, omit.
 <<<
 <<<DICTIONARY>>>
+>>>
+
+Participant's own notebook (typed by the user during / after the meeting). Treat it as **authoritative** for decisions, owners, due dates and action items, and as a hint for what mattered most; it may be terse or partial:
+<<<
+<<<NOTEBOOK>>>
 >>>
 
 Live insight comments captured during the meeting (each was produced from one transcript chunk; may be redundant or partly out of date):
@@ -701,8 +706,10 @@ async def llm_synthesize_web_findings(
 # LLM understands the input was truncated. Tunable via env for users with bigger context windows.
 _MEETING_SUMMARY_TRANSCRIPT_CHAR_CAP = 24000
 _MEETING_SUMMARY_INSIGHTS_CHAR_CAP = 6000
+_MEETING_SUMMARY_NOTEBOOK_CHAR_CAP = 8000
 MEETING_SUMMARY_TRUNCATION_MARKER = "(…earlier transcript truncated for summary…)"
 MEETING_SUMMARY_INSIGHTS_TRUNCATION_MARKER = "(…earlier live insights truncated for summary…)"
+MEETING_SUMMARY_NOTEBOOK_TRUNCATION_MARKER = "(…earlier notebook content truncated for summary…)"
 MEETING_SUMMARY_OFFLINE_MARKDOWN = (
     "## Key takeaways\n\n"
     "- LLM unavailable: no `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / "
@@ -746,6 +753,7 @@ async def llm_meeting_summary(
     meeting_title: str = "",
     meeting_context: str = "",
     dictionary_terms: "object" = (),
+    notebook: str = "",
 ) -> str:
     """Produce a post-meeting markdown summary with **Key takeaways** and **Next actions**.
 
@@ -755,7 +763,8 @@ async def llm_meeting_summary(
       diagnostic line so the user knows why.
     """
     transcript = (transcript_text or "").strip()
-    if not transcript:
+    notebook_text = (notebook or "").strip()
+    if not transcript and not notebook_text:
         return (
             "## Key takeaways\n\n"
             "- No transcript was captured for this meeting.\n\n"
@@ -778,6 +787,11 @@ async def llm_meeting_summary(
         MEETING_SUMMARY_INSIGHTS_TRUNCATION_MARKER,
     )
     ctx = meeting_context.strip() if meeting_context else "(none)"
+    notebook_blob = (
+        _tail_truncate(notebook_text, _MEETING_SUMMARY_NOTEBOOK_CHAR_CAP, MEETING_SUMMARY_NOTEBOOK_TRUNCATION_MARKER)
+        if notebook_text
+        else "(none)"
+    )
 
     prompt = (
         MEETING_SUMMARY_TEMPLATE.replace(
@@ -785,8 +799,9 @@ async def llm_meeting_summary(
         )
         .replace("<<<MEETING_CONTEXT>>>", ctx)
         .replace("<<<DICTIONARY>>>", _dictionary_block(dictionary_terms))
+        .replace("<<<NOTEBOOK>>>", notebook_blob)
         .replace("<<<INSIGHTS>>>", insights_blob)
-        .replace("<<<SNIPPET>>>", transcript_blob)
+        .replace("<<<SNIPPET>>>", transcript_blob or "(no transcript captured)")
     )
 
     text, err = await _llm_user_text_with_retry(prompt, 1024)

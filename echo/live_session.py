@@ -22,7 +22,8 @@ from echo.text_utils import format_timestamp_hms
 if TYPE_CHECKING:
     from textual.widgets import RichLog
 
-    from echo.app import EchoApp, TranscriptSegment
+    from echo.engine.session import EchoSession as EchoApp
+    from echo.engine.text import TranscriptSegment
 
 
 class LiveTranscriptionSession:
@@ -31,6 +32,11 @@ class LiveTranscriptionSession:
     All previously-``nonlocal`` state of ``_transcription_from_live`` lives here as instance
     attributes, which makes the segment-finalization rules far easier to read and to test.
     """
+
+    _router = None
+    _apple = None
+    _stream_committed = ""
+    _stream_partial = ""
 
     def __init__(self, app: "EchoApp", log: "RichLog") -> None:
         self.app = app
@@ -66,6 +72,14 @@ class LiveTranscriptionSession:
         self._draft_last_snapshot_text = ""
         self._draft_last_snapshot_at = 0.0
 
+        # Streaming backend (Apple on-device): one helper process; finals commit, partials replace.
+        self._router = None  # type: ignore[assignment]
+        self._apple = None  # type: ignore[assignment]
+        self._stream_committed = ""
+        self._stream_partial = ""
+        self._stream_wall_base = 0.0
+        self._stream_retry_at = 0.0
+
         # Cached language for the duration of this session (cycled via the 'l' key).
         self._lang = self.app.live_asr_language
         # After pause, arm at most one post-drain forced insight per "idle" episode (see main loop).
@@ -96,6 +110,7 @@ class LiveTranscriptionSession:
         self._draft_stable_after = 0.0
         self._draft_last_snapshot_text = ""
         self._draft_last_snapshot_at = 0.0
+        self._stream_committed = ""
 
     async def _start_draft(
         self,
@@ -122,7 +137,7 @@ class LiveTranscriptionSession:
         self._draft_stable_after = seg.stable_after
         self._draft_last_snapshot_text = payload
         self._draft_last_snapshot_at = time.monotonic()
-        from echo.app import TranscriptSegment as _Seg
+        from echo.engine.text import TranscriptSegment as _Seg
 
         await self.app._transcript_queue.put(
             _Seg(
@@ -143,7 +158,7 @@ class LiveTranscriptionSession:
         text: str,
         allow_correction: bool,
     ) -> None:
-        from echo.app import _normalize_spaces
+        from echo.engine.text import _normalize_spaces
 
         payload = _normalize_spaces(text)
         if not payload:
@@ -162,6 +177,12 @@ class LiveTranscriptionSession:
 
         prev_spoken = self.app._line_id_to_spoken.get(seg_id, self._draft_segment.spoken_text)
         merged = _normalize_spaces(f"{prev_spoken} {payload}")
+        await self._set_draft_text(idx, merged, t1w=t1w, allow_correction=allow_correction)
+
+    async def _set_draft_text(self, idx: int, merged: str, *, t1w: float, allow_correction: bool) -> None:
+        """Replace the in-flight draft line's text (index ``idx`` in ``app._lines``)."""
+        assert self._draft_segment is not None and self._draft_t0w is not None
+        seg_id = self._draft_segment.line_id
         line = f"[{format_timestamp_hms(self._draft_t0w)}–{format_timestamp_hms(t1w)}] {merged}"
         self.app._lines[idx] = line
         self.app._line_id_to_spoken[seg_id] = merged
@@ -182,7 +203,7 @@ class LiveTranscriptionSession:
         if should_snapshot:
             self._draft_last_snapshot_text = merged
             self._draft_last_snapshot_at = now
-            from echo.app import TranscriptSegment as _Seg
+            from echo.engine.text import TranscriptSegment as _Seg
 
             await self.app._transcript_queue.put(
                 _Seg(
@@ -215,6 +236,9 @@ class LiveTranscriptionSession:
         seg.stable_after = self._draft_stable_after
         seg.finalized = True
         await self.app._transcript_queue.put(seg)
+        on_final = getattr(self.app, "_on_segment_finalized", None)
+        if on_final is not None:
+            await on_final(seg)
         self.app._last_live_emitted_spoken = spoken
         self.app._debug_note(
             f"flush local reason={reason} chars={len(spoken)} allow_fix={self._draft_allow_correction}",
@@ -224,7 +248,7 @@ class LiveTranscriptionSession:
 
     def _draft_finalize_reason(self, *, reason: str, idle_for: float) -> str:
         """Decide whether the in-flight draft should be finalized now, and why."""
-        from echo.app import (
+        from echo.engine.text import (
             _LIVE_SENTENCE_END_ANYWHERE_RE,
             _LIVE_SENTENCE_END_RE,
             _line_span_seconds,
@@ -273,7 +297,7 @@ class LiveTranscriptionSession:
         return ""
 
     async def _flush_pending(self, reason: str) -> None:
-        from echo.app import _normalize_spaces
+        from echo.engine.text import _normalize_spaces
 
         if not self._pending_texts or self._pending_t0w is None or self._pending_t1w is None:
             idle_for = (
@@ -347,7 +371,7 @@ class LiveTranscriptionSession:
         self._clear_pending()
 
     async def _flush_if_needed(self, *, idle_tick: bool) -> None:
-        from echo.app import _should_flush_live_pending
+        from echo.engine.text import _should_flush_live_pending
 
         idle_for = (
             time.monotonic() - self._last_voiced_wall if self._last_voiced_wall > 0 else 0.0
@@ -495,6 +519,10 @@ class LiveTranscriptionSession:
         self._last_voiced_wall = 0.0
         self._audio_blocks.clear()
         self._audio_block0_off = 0
+        if self._apple is not None:
+            self._apple.stop()
+            self._apple = None
+        self._stream_partial = ""
         self.app._live_wall_t0 = time.monotonic()
         self.app._last_live_emitted_spoken = ""
         self._drain_capture_queue()
@@ -622,9 +650,162 @@ class LiveTranscriptionSession:
             app._live_capture_queue_depth = self._capture_out_queue_depth()
         return n_moved
 
+    # ------------------------------------------------------------------ backend routing
+
+    def _sync_backend_label(self) -> None:
+        """Surface router-driven backend switches (failure fallback, recovery, language change)."""
+        from echo.engine.text import _render_asr_load_source_label
+
+        router = self._router
+        if router is None:
+            return
+        src = router.display_source()
+        if src != self.app.asr_load_source:
+            self.app.asr_load_source = src
+            self.app._log_transcript_meta(
+                self.log, f"[yellow]ASR backend: {_render_asr_load_source_label(src)}.[/]"
+            )
+            self.app._tick_header()
+
+    def _stream_joiner(self) -> str:
+        lang = self.app.live_asr_language or self._lang
+        return "" if lang in ("japanese", "chinese") else " "
+
+    async def _ensure_apple_stream(self) -> bool:
+        from echo.asr_apple import AppleStreamingRecognizer
+
+        app = self.app
+        lang = app.live_asr_language or self._lang
+        rec = self._apple
+        if rec is not None and rec.language == lang and rec.alive:
+            return True
+        if rec is not None:
+            await self._stop_apple_stream(drain=rec.alive)
+            await self._flush_pending("pause")
+        if time.monotonic() < self._stream_retry_at:
+            return False
+        rec = AppleStreamingRecognizer(lang)
+        try:
+            await asyncio.to_thread(rec.start)
+        except Exception as e:  # noqa: BLE001
+            await self._on_stream_failure(f"could not start: {e}")
+            return False
+        self._apple = rec
+        buffered_s = self._audio_stream_sample_count() / float(self._sr)
+        self._stream_wall_base = (
+            time.monotonic() - (app._live_wall_t0 or time.monotonic()) - buffered_s
+        )
+        app._debug_note(f"apple stream started locale={rec.locale}")
+        return True
+
+    async def _stop_apple_stream(self, *, drain: bool) -> None:
+        rec = self._apple
+        self._apple = None
+        if rec is None:
+            return
+        if drain:
+            events = await asyncio.to_thread(rec.finish, 5.0)
+            await self._handle_stream_events([e for e in events if e.kind != "exit"])
+        else:
+            rec.stop()
+        self._stream_partial = ""
+
+    async def _on_stream_failure(self, detail: str) -> None:
+        app = self.app
+        self._apple = None
+        self._stream_partial = ""
+        await self._flush_pending("pause")
+        app._log_transcript_meta(self.log, f"[red]Apple speech helper stopped:[/] {detail}")
+        app._live_meter_note = "ASR error"
+        self._stream_retry_at = time.monotonic() + 2.0
+        self._router.record_failure("apple_on_device", detail)
+        self._sync_backend_label()
+
+    async def _update_stream_draft(self, *, t0w: float, t1w: float) -> None:
+        j = self._stream_joiner()
+        text = j.join(p for p in (self._stream_committed, self._stream_partial) if p).strip()
+        if not text:
+            return
+        self._last_voiced_wall = time.monotonic()
+        if not self.app._paused:
+            self.app._live_meter_note = "Transcribing"
+        if self._draft_segment is not None:
+            idx = self.app._line_id_to_index.get(self._draft_segment.line_id)
+            if idx is not None and 0 <= idx < len(self.app._lines):
+                await self._set_draft_text(idx, text, t1w=t1w, allow_correction=True)
+                return
+        await self._start_draft(t0w=t0w, t1w=t1w, payload=text, allow_correction=True)
+
+    async def _handle_stream_events(self, events: list) -> None:
+        base = self._stream_wall_base
+        for ev in events:
+            if ev.kind == "partial":
+                self._stream_partial = ev.text.strip()
+                await self._update_stream_draft(t0w=base + ev.start, t1w=base + ev.end)
+            elif ev.kind == "final":
+                self._stream_partial = ""
+                text = ev.text.strip()
+                if text:
+                    j = self._stream_joiner()
+                    self._stream_committed = (
+                        f"{self._stream_committed}{j}{text}" if self._stream_committed else text
+                    )
+                await self._update_stream_draft(t0w=base + ev.start, t1w=base + ev.end)
+                self._router.record_success("apple_on_device")
+                fin_reason = self._draft_finalize_reason(reason="", idle_for=0.0)
+                if fin_reason:
+                    await self._finalize_live_draft(fin_reason)
+            elif ev.kind == "error":
+                self.app._debug_note(f"apple stream error: {ev.text}")
+            elif ev.kind == "ready":
+                self.app._debug_note("apple stream ready")
+            elif ev.kind == "exit":
+                await self._on_stream_failure(ev.text or "helper exited")
+                return
+
+    async def _async_run_streaming_pass(self, log: "RichLog") -> bool:
+        """Feed all buffered audio to the streaming helper and apply partial/final results."""
+        if not await self._ensure_apple_stream():
+            self._audio_blocks.clear()
+            self._audio_block0_off = 0
+            return False
+        rec = self._apple
+        progressed = False
+        if self._audio_blocks:
+            parts = [
+                b[self._audio_block0_off :] if i == 0 else b
+                for i, b in enumerate(self._audio_blocks)
+            ]
+            self._audio_blocks.clear()
+            self._audio_block0_off = 0
+            try:
+                await asyncio.to_thread(rec.feed, np.concatenate(parts))
+            except RuntimeError as e:
+                self.app._debug_note(f"apple stream feed error: {e!s}")
+            progressed = True
+        events = rec.poll()
+        if events:
+            progressed = True
+            await self._handle_stream_events(events)
+        if not self._stream_partial:
+            await self._flush_if_needed(idle_tick=True)
+        return progressed
+
     async def _async_run_buffered_asr_pass(self, log: "RichLog") -> bool:
+        """Dispatch to the streaming or windowed ASR path for the router's active backend."""
+        router = self._router
+        if router is not None:
+            router.maybe_upgrade(self.app.live_asr_language or self._lang)
+            self._sync_backend_label()
+            if router.is_streaming():
+                return await self._async_run_streaming_pass(log)
+            if self._apple is not None:
+                await self._stop_apple_stream(drain=True)
+        return await self._async_run_windowed_asr_pass(log)
+
+    async def _async_run_windowed_asr_pass(self, log: "RichLog") -> bool:
         """Run ASR on every full window in ``_audio_blocks`` (same rules as the main live loop)."""
-        from echo.app import (
+        from echo.engine.text import (
             _live_chunk_metrics,
             _normalize_spaces,
             _passes_live_voice_gate,
@@ -727,6 +908,9 @@ class LiveTranscriptionSession:
                 app._live_meter_note = "ASR error"
                 app._debug_note(f"asr chunk error: {e!s}")
                 progressed = True
+                self._sync_backend_label()
+                if self._router is not None and self._router.is_streaming():
+                    return progressed
                 continue
             chunk_secs = max(1e-6, (self._chunk_samples / self._sr))
             decode_secs = max(0.0, asr_t1 - asr_t0)
@@ -817,13 +1001,15 @@ class LiveTranscriptionSession:
     # ------------------------------------------------------------------ main loop
 
     async def run(self) -> None:
-        from echo.app import (
+        from echo.engine.text import (
             _render_asr_load_source_label,
         )
+        from echo.asr_routing import get_router
         from echo.connectivity import hub_local_only_from_env
 
         app = self.app
         log = self.log
+        self._router = get_router()
 
         app._log_transcript_meta(
             log,
@@ -920,6 +1106,11 @@ class LiveTranscriptionSession:
 
                 await self._async_run_buffered_asr_pass(log)
         finally:
+            if self._apple is not None:
+                try:
+                    await self._stop_apple_stream(drain=True)
+                except Exception as e:  # noqa: BLE001
+                    app._debug_note(f"apple stream drain error: {e!s}")
             await self._flush_pending("stop")
             app._live_meter_note = "Stopped"
             app._debug_note("live transcription stopped")

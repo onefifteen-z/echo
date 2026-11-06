@@ -1,0 +1,58 @@
+{
+  "name": "echo-gui",
+  "productName": "Echo",
+  "version": "0.1.0",
+  "description": "Echo desktop app: live meeting transcription + insights (Electron front-end for the Python echo-server sidecar)",
+  "main": "dist/main/main/main.js",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -k -n renderer,main,preload,electron -c blue,green,magenta,cyan \"npm run dev:renderer\" \"npm run dev:main\" \"npm run dev:preload\" \"npm run dev:electron\"",
+    "dev:renderer": "vite",
+    "dev:main": "tsc -p tsconfig.main.json --watch --preserveWatchOutput",
+    "dev:preload": "tsc -p tsconfig.preload.json --watch --preserveWatchOutput",
+    "dev:electron": "wait-on -l tcp:5174 file:dist/main/main/main.js file:dist/preload/preload/preload.js && cross-env NODE_ENV=development electronmon .",
+    "build": "npm run build:renderer && npm run build:main && npm run build:preload",
+    "build:main": "tsc -p tsconfig.main.json",
+    "build:preload": "tsc -p tsconfig.preload.json",
+    "build:renderer": "vite build",
+    "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.preload.json --noEmit && tsc -p tsconfig.renderer.json --noEmit",
+    "start": "electron .",
+    "test": "vitest run",
+    "package": "npm run build && electron-builder --config electron-builder.json",
+    "package:mac": "npm run build && electron-builder --config electron-builder.json --mac"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^9.0.1",
+    "remark-gfm": "^4.0.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.2.2",
+    "@types/node": "^22.10.5",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/ws": "^8.5.13",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "cross-env": "^10.1.0",
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8",
+    "electronmon": "^2.0.4",
+    "tailwindcss": "^4.2.2",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.7",
+    "vitest": "^2.1.8",
+    "wait-on": "^9.0.5"
+  },
+  "electronmon": {
+    "patterns": [
+      "!**/*",
+      "dist/main/**",
+      "dist/preload/**",
+      "!**/*.map"
+    ],
+    "logLevel": "quiet"
+  }
+}

@@ -41,6 +41,13 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e .
 ```
 
+**Use a dedicated virtualenv, not a conda base env.** On Apple Silicon, macOS kills a process outright (`SIGKILL (Code Signature Invalid)`) when it loads a native extension whose arm64 signature is missing or modified. Long-lived conda base envs often contain such files (for example a modified `lib-dynload/_sqlite3`), and Echo imports several native modules lazily mid-session, so the symptom used to be a silent kill during a meeting plus mouse escape codes left in the terminal.
+
+- On startup, `echo-tui` imports the risky native modules in a child process first and exits with a message naming the broken module (`ECHO_SKIP_PREFLIGHT=1` disables this).
+- Fatal-signal tracebacks are written to `./log/echo_crash_<timestamp>.log`.
+- `bin/echo-live` / `bin/echo-live-debug` prefer `.venv/bin/echo-tui` and restore the terminal on exit.
+- `echo-probe` reports the interpreter in use, arm64 signature problems, Apple speech model status, and a real Whisper API call.
+
 ### Optional: local speech-to-text (`--audio`)
 
 ASR uses PyTorch + Transformers + Torchaudio. Install the extra group:
@@ -84,7 +91,11 @@ echo-tui --live --live-system-authorized
 
 # ASR options
 echo-tui --audio meeting.wav --chunk-seconds 30 --model-id kotoba-tech/kotoba-whisper-v2.2
-echo-tui --audio meeting.wav --whisper-device cuda   # or: cpu, mps
+echo-tui --audio meeting.wav --whisper-device cuda   # local Kotoba only: cpu, cuda, mps
+echo-tui --live --asr-backend apple                  # force Apple on-device (macOS)
+echo-tui --live --asr-backend api                    # force Whisper API
+echo-tui --live --asr-backend local                  # force local Kotoba-Whisper
+echo-tui --install-apple-speech ja                   # one-time download of Apple's on-device ja model
 ```
 
 Same entry point without a script name clash (with the venv activated):
@@ -93,14 +104,14 @@ Same entry point without a script name clash (with the venv activated):
 python -m echo --replay samples/sample_transcript.txt --line-delay 0.8
 ```
 
-### Test LLM + web search / ddgs (no TUI)
+### Test LLM + web search (no TUI)
 
 ```bash
 echo-probe
 # optional: echo-probe --llm-timeout 60 --ddg-timeout 20 --ddg-query "your query"
 ```
 
-Loads the same `.env` rules as the app (repo root then cwd), prints which LLM route is active, runs one small **keywords/summary** call and one **ddgs** text search, then exits `0` / `1`.
+Loads the same `.env` rules as the app (repo root then cwd), prints which LLM route is active, runs one small **keywords/summary** call and one web search (Perplexity when configured, else ddgs; prints the provider), then exits `0` / `1`.
 
 ### Environment variables
 
@@ -110,14 +121,34 @@ Loads the same `.env` rules as the app (repo root then cwd), prints which LLM ro
 2. **`BASE_URL` + `API_KEY` + `MODEL` all set** → OpenAI-compatible Chat Completions (typical **[LiteLLM](https://github.com/BerriAI/litellm)** proxy: point `BASE_URL` at your proxy’s OpenAI API root, often ending in `/v1`)  
 3. `OPENAI_API_KEY` → official OpenAI API (`ECHO_OPENAI_MODEL` optional, default `gpt-4o-mini`)
 
+**ASR routing order** (with `--audio` or `--live`; override via `--asr-backend` or `ECHO_ASR_BACKEND`):
+
+1. **macOS on-device** — Apple **SpeechAnalyzer / SpeechTranscriber** (macOS 26+, falls back to on-device `SFSpeechRecognizer`). In `--live` this is a **streaming** backend: one long-running helper process receives audio continuously and returns partial + final results (no fixed chunks). Requires **Speech Recognition** permission and the per-language model; install it with `echo-tui --install-apple-speech ja` (or accept the prompt at startup / the GUI's *Download model* button).  
+2. **Whisper API** — OpenAI-compatible **`/v1/audio/transcriptions`**. Prefer **`ECHO_WHISPER_API_BASE_URL` + `API_KEY` + `ECHO_WHISPER_API_MODEL`** when the transcription endpoint differs from chat; otherwise `BASE_URL` + `API_KEY` (chat `MODEL` is ignored for ASR), or `OPENAI_API_KEY` for the official API.  
+3. **Local Kotoba-Whisper** — Hugging Face weights via Transformers (`pip install -e '.[asr]'`). Used in `auto` when offline/API unreachable, or when forced with `--asr-backend local`.
+
+The router caches probe results, switches away from a backend after **3 consecutive failures** (exponential cool-down 30–300 s, re-checked every 60 s so it upgrades back to Apple/API when they recover), never loads Kotoba weights mid-session from a worker thread, and in a **forced** mode (`apple`/`api`/`local`) fails loudly instead of silently falling back. The Whisper API path uses a request timeout, passes the recent transcript as `prompt` for continuity, and drops typical silence hallucinations (“Thanks for watching”, “ご視聴ありがとうございました”…) on near-silent chunks.
+
+Default is **`auto`**: **Apple (on-device)** for the **current live language** → **Whisper API** when Apple is unavailable for that language → **local Kotoba** only when offline/API unreachable, or **`--asr-backend local`**. Apple support differs by locale (e.g. ja-JP may download later while en-US/zh-CN are ready); Echo **re-probes on each language switch** and does **not** download Kotoba weights at startup unless the resolved backend is local.
+
 | Variable | Purpose |
 |----------|---------|
-| `ECHO_WHISPER_DEVICE` | `cpu`, `cuda`, or `mps` for ASR (if unset, auto). |
+| `ECHO_ASR_BACKEND` | `auto` (default), `apple`, `api`, or `local`. Same as `--asr-backend`. |
+| `ECHO_WHISPER_API_MODEL` | Whisper model id for API ASR (default `whisper-1`). Used with `BASE_URL`+`API_KEY` or `OPENAI_API_KEY`. |
+| `ECHO_WHISPER_API_BASE_URL` | Optional **separate** OpenAI-compatible root for `/audio/transcriptions` (e.g. `https://whisper-proxy.example/v1`). Uses the same `API_KEY` as LLM when set; does not use the chat `MODEL`. |
+| `ECHO_WHISPER_API_TIMEOUT` | Seconds per Whisper API request (default `20`; one retry). |
+| `ECHO_WHISPER_API_CHUNK_SECONDS` | Live window length when the Whisper API is the active backend (default `8`). `--chunk-seconds` overrides. |
+| `ECHO_NO_APPLE_INSTALL_PROMPT` | Set to `1` to skip the startup prompt offering to download a missing Apple on-device speech model. |
+| `ECHO_WHISPER_DEVICE` | `cpu`, `cuda`, or `mps` for **local** Kotoba ASR (if unset, auto). |
 | `ANTHROPIC_API_KEY` | Claude for insights + chat. Optional: `ECHO_ANTHROPIC_MODEL`. |
 | `BASE_URL`, `API_KEY`, `MODEL` | Together: OpenAI-compatible endpoint (LiteLLM, vLLM, etc.). Uses `openai` Python SDK with `base_url`. |
 | `OPENAI_API_KEY` | Official OpenAI. Optional: `ECHO_OPENAI_MODEL`. |
 | `ECHO_INSIGHT_LLM_TIMEOUT` | Seconds for each insights LLM call (default `120`). |
 | `ECHO_INSIGHT_DDG_TIMEOUT` | Seconds for each ddgs web search in insights (default `45`). |
+| `ECHO_PERPLEXITY_BASE_URL` | OpenAI-compatible root for **Perplexity Sonar** web search (e.g. an AI-gateway Perplexity route, `https://…/v1`). When set together with a key, insights search uses Perplexity first. Alias: `AI_GATEWAY_PERPLEXITY_BASE_URL`. Must be `https://`. |
+| `ECHO_PERPLEXITY_API_KEY` | Key for Perplexity search. Falls back to `AI_GATEWAY_API_KEY`, then the shared `API_KEY`. |
+| `ECHO_PERPLEXITY_MODEL` | Sonar model (default `sonar`). Alias: `AI_GATEWAY_PERPLEXITY_MODEL`. |
+| `ECHO_PERPLEXITY_TIMEOUT` | Seconds per Perplexity request (default `30`; one retry). Keep `ECHO_INSIGHT_DDG_TIMEOUT` larger, since it bounds Perplexity + ddgs fallback together. |
 | `ECHO_DDGS_BACKEND` | Metasearch backend for the `ddgs` library: `auto` (default), `bing`, `duckduckgo`, `yahoo`, … (see [ddgs docs](https://pypi.org/project/ddgs/)). If unset and `auto` returns nothing, Echo tries `bing`, then `duckduckgo`, then `yahoo`. |
 | `ECHO_NO_SPLASH` | Set to `1` / `true` / `yes` to skip the green ASCII **ECHO** startup splash (e.g. for automation). |
 | `ECHO_WHISPER_LANGUAGE` | Whisper `language=` for forced decoder ids (default `japanese` for Kotoba). Set e.g. `english` or `chinese` for other models. |
@@ -154,6 +185,10 @@ Loads the same `.env` rules as the app (repo root then cwd), prints which LLM ro
 If the **Insights** panel stays on “Updating…”, it was usually a **hung or failing LLM/search request** with no UI recovery (now fixed: timeouts + error text). Check `BASE_URL` / keys, corporate proxy, or search rate limits; try `ECHO_DDGS_BACKEND=bing`; increase timeouts via the env vars above if needed.
 
 If no LLM configuration is detected, Echo still runs: keywords use a small heuristic, summaries note that LLM is off, and chat replies tell you to set a key.
+
+### Web search
+
+Insight passes routed to **web search** use **Perplexity Sonar** when `ECHO_PERPLEXITY_BASE_URL` (or `AI_GATEWAY_PERPLEXITY_BASE_URL`) and a key are set; only **cited URLs** become results. If Perplexity is not configured, errors (auth, quota, rate limit, timeout) or returns no citations, Echo falls back to the keyless **ddgs** metasearch (`auto` → `bing` → `duckduckgo` → `yahoo`, or just `ECHO_DDGS_BACKEND`). The Insights web section shows which provider answered and any fallback reason; `echo-probe` reports the active provider.
 
 ### Offline / LLM reachability
 
@@ -337,12 +372,60 @@ Pressing `s` writes the current meeting to its output directory:
 | `insights.md` | All live insight passes (comments + research summaries + web hits). |
 | `meeting_context.md` | Meeting title and the background context entered at start. |
 | `summary.md` | **LLM-generated post-meeting summary** with two sections — `## Key takeaways` and `## Next actions`. |
+| `notebook.md` | Your own free-form notes (desktop app notebook; empty in the TUI). |
+| `insights.json` | Structured insight passes, used to regenerate the summary later. |
+| `meeting.json` | Metadata: id, title, context, start/end time, duration, mode, language, ASR backend, line count. |
 
 `summary.md` is rendered by the configured LLM using the transcript, the live insight comments,
-the meeting title / context, and the optional glossary. While the LLM call is in flight the file
+the meeting title / context, your notebook (treated as authoritative for decisions and action items), and the optional glossary. While the LLM call is in flight the file
 contains a `_Generating meeting summary…_` placeholder, then is overwritten when the response
 arrives. If no LLM provider is configured (or the call fails), `summary.md` falls back to a static
 markdown stub explaining how to enable it.
+
+## Desktop app (`gui/`)
+
+An Electron + React + Tailwind front end (same stack as Lumina) that drives the Python engine through a local WebSocket sidecar (`echo-server`). It has a setup dialog (title, context, audio source, language, speech engine, microphone, Apple model download), live transcript with draft/final lines, level meter, status chips (ASR backend, mic-only warning, LLM availability), insights with collapsible web results, and meeting chat. Outputs go to `~/Documents/Echo/<YYYY-MM-DD HHMM> <title>/` by default (the folder can be changed in Settings; dated folders, so meetings with the same title never overwrite each other; the folder name is the meeting id).
+
+- **Notebook:** during a meeting, the *My notebook* tab (next to chat) is a Markdown notepad that autosaves into the session; it is written to `notebook.md` and included in the summary.
+- **Meetings view** (left rail): lists past meetings (newest first, searchable by title, context and summary) with date, duration, line count and summary preview. A meeting shows:
+  - **Summary** with a *Regenerate summary* button (re-runs the LLM with transcript, insights, context and notebook).
+  - **Notebook** (editable, autosaved).
+  - **Transcript** and **Insights** (read-only).
+  - **Details**: editable context plus metadata.
+  - The title is editable inline; *Open folder* opens the meeting in Finder.
+  - *Delete* moves the folder to the macOS Trash, so it can be recovered.
+  - The meeting in progress is marked **Live**: edits go to the running session, while regenerate and delete wait until the meeting ends.
+- Folders written by older versions (no `meeting.json`) are still listed, using the folder name as title and its modification time as date.
+- **Settings view** (bottom of the left rail): edits the engine configuration for the desktop app.
+  - **Groups:** Workspace (meetings folder, glossary file), Language model, Speech recognition (default engine, Whisper API, local device, Apple on-device model status with *Download*), Web search, Insights & transcript, Network & debugging.
+  - **Advanced:** any other variable from the table above.
+  - **Source badges:** each field shows where its current value comes from, *Echo settings* or *.env* (shell environment / `.env`). An empty field uses the built-in default, shown as the placeholder.
+  - **Storage:** settings are stored in `~/Library/Application Support/Echo/settings.json`. Values whose name contains `KEY`, `TOKEN`, `SECRET` or `PASSWORD` are encrypted with the macOS Keychain (Electron `safeStorage`) and never sent back to the window.
+  - **Precedence:** values from settings are passed to the engine as environment variables, so they override your shell and `.env`. *Remove override* falls back to those again. The terminal app (`echo`) does not read these settings.
+  - **Saving:** saving restarts the engine. If a meeting is running, you can end it (it is saved first) and restart, or save now and apply later.
+  - **Meetings folder:** changing it affects new meetings and the Meetings list; existing folders are not moved.
+
+```bash
+# Development (uses the repo .venv: python3 -m venv .venv && .venv/bin/pip install -e '.[asr]')
+cd gui && npm install && npm run dev
+
+# Type-check / unit tests / production build / macOS package
+npm run typecheck && npm test && npm run build
+npm run package
+```
+
+- **Python runtime:** in development the app runs `../.venv/bin/python -m echo.server`. A packaged app bundles the `echo` sources and on first launch creates **`~/.echo/venv`** (needs Python ≥ 3.10, Homebrew preferred) and installs Echo into it; it is re-installed when the app version changes.
+- **Configuration:** the packaged app reads **`~/.echo/.env`** (same variables as above). In development the repo `.env` is used. Values from the Settings view take precedence over both.
+- **Permissions:** the app requests **Microphone** access; **Speech Recognition** and **Screen & System Audio Recording** prompts appear the first time Apple ASR or system-audio capture is used.
+- **Crashes:** if the sidecar dies it is restarted automatically (up to 3 times per minute); after that the window shows the error tail and a *Restart engine* button. Sidecar logs: `~/Library/Application Support/Echo/echo-sidecar.log`. Set `ECHO_PYTHON=/path/to/python` to use a specific interpreter.
+
+### Sidecar protocol (`echo-server`)
+
+`echo-server [--host 127.0.0.1] [--port 0] [--output-root DIR]` prints one JSON line `{"port", "token", "protocol"}` to stdout, then serves `ws://127.0.0.1:<port>/?token=<token>`. It exits on SIGTERM or when stdin closes. Messages are JSON:
+
+- Request `{"id", "cmd", "args"}` → response `{"id", "ok", "result" | "error"}`.
+- Commands: `ping`, `probe`, `devices.list`, `apple.status`, `apple.install_assets`, `session.start` (`title`, `context`, `source`: `mic`/`both`/`system`/`demo`, `backend`, `language`, `mic_device`, `chunk_seconds`, `line_delay`), `session.stop`, `session.pause`, `session.resume`, `session.reset`, `session.set_language`, `session.save`, `session.snapshot`, `session.notebook.set` (`text`), `chat.ask`, `meetings.list`, `meetings.get` (`id`), `meetings.update` (`id`, optional `title` / `context` / `notebook`), `meetings.regenerate_summary` (`id`; emits `summary.written` with `id`), `config.effective` (`keys`; returns `{value, source: app|env|default, secret}` per key, with secret values masked). `probe` also reports the active web search provider. Deleting is done by the Electron main process (`shell.trashItem`), not the sidecar.
+- Server-pushed events `{"event": {...}}` mirror `echo/engine/events.py` (`transcript.draft`, `transcript.final`, `transcript.corrected`, `insight.pending`, `insight.pass`, `meter`, `status`, `notice`, `chat.reply`, `summary.written`, `session.ended`, …).
 
 ## Project layout
 
@@ -350,9 +433,17 @@ markdown stub explaining how to enable it.
 echo/
   __main__.py   # CLI
   splash.py     # ASCII ECHO startup modal
-  app.py        # Textual UI + workers
+  app.py        # Textual UI (subscriber of the engine)
+  engine/       # Headless EchoSession, event types, text helpers, ASR setup
+  server.py     # echo-server WebSocket sidecar for the desktop app
+  live_session.py   # Live capture → ASR (streaming Apple / windowed API & local) → drafts
+  asr_routing.py    # AsrRouter: Apple → Whisper API → local Kotoba, backoff + upgrade
+  asr_apple.py      # Apple Speech helper build, model install, streaming recognizer
+  asr_api.py        # OpenAI-compatible Whisper API client
+  meetings.py       # Saved-meeting archive (list / read / edit / regenerate summary)
   live_audio.py # sounddevice capture (mic + optional loopback)
   macos/SystemAudioCapture.swift  # bundled ScreenCaptureKit helper for --live-system-authorized
+  macos/SpeechTranscribe.swift    # bundled on-device Speech helper for ASR (macOS)
   asr.py        # Kotoba-Whisper weights, chunked inference
   audio_filters.py  # Optional VAD (Silero/WebRTC) + denoise (noisereduce)
   llm.py        # Optional Anthropic / OpenAI + fallbacks
@@ -360,6 +451,7 @@ echo/
   dictionary.py # Optional glossary loader (dictionary.yml -> LLM prompts)
 samples/
   sample_transcript.txt
+gui/            # Electron + React desktop app (see "Desktop app")
 dictionary.yml.example
 pyproject.toml
 ```

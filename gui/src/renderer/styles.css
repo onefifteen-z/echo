@@ -1,0 +1,94 @@
+@import "tailwindcss";
+
+@theme {
+  --color-canvas: #0f1115;
+  --color-panel: #161a21;
+  --color-panel-2: #1c212a;
+  --color-line: #2a303b;
+  --color-accent: #e0873a;
+  --color-accent-soft: rgba(224, 135, 58, 0.15);
+  --font-sans: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "PingFang SC", "Segoe UI", sans-serif;
+  --font-mono: "SF Mono", ui-monospace, Menlo, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-canvas);
+  color: #e6e8eb;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+/* macOS hidden-inset title bar: the top strip drags the window. */
+.drag {
+  -webkit-app-region: drag;
+}
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+.selectable {
+  user-select: text;
+}
+
+.markdown {
+  font-size: 0.875rem;
+  line-height: 1.55;
+}
+.markdown p {
+  margin: 0.35rem 0;
+}
+.markdown ul,
+.markdown ol {
+  margin: 0.35rem 0;
+  padding-left: 1.25rem;
+}
+.markdown ul {
+  list-style: disc;
+}
+.markdown ol {
+  list-style: decimal;
+}
+.markdown a {
+  color: var(--color-accent);
+  text-decoration: underline;
+}
+.markdown code {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  background: var(--color-panel-2);
+  padding: 0.05rem 0.3rem;
+  border-radius: 0.25rem;
+}
+.markdown pre {
+  background: var(--color-panel-2);
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.375rem;
+  overflow-x: auto;
+}
+.markdown h1,
+.markdown h2,
+.markdown h3 {
+  font-weight: 600;
+  margin: 0.5rem 0 0.25rem;
+}
+.markdown blockquote {
+  border-left: 2px solid var(--color-line);
+  padding-left: 0.75rem;
+  color: #9aa3ae;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a303b;
+  border-radius: 4px;
+}

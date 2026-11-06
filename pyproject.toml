@@ -11,6 +11,7 @@ dependencies = [
   "openai>=1.50.0",
   "python-dotenv>=1.0.0",
   "PyYAML>=6.0",
+  "websockets>=13.0",
 ]
 
 [project.optional-dependencies]
@@ -37,6 +38,7 @@ asr-vad = [
 [project.scripts]
 echo-tui = "echo.__main__:main"
 echo-probe = "echo.probe:main"
+echo-server = "echo.server:main"
 
 [build-system]
 requires = ["setuptools>=68"]

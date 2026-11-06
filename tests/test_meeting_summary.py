@@ -87,6 +87,27 @@ def test_llm_meeting_summary_prompt_includes_title_context_glossary_insights(
     assert "## Next actions" in out
 
 
+def test_llm_meeting_summary_includes_notebook(monkeypatch: pytest.MonkeyPatch) -> None:
+    import echo.llm as llm
+
+    prompts: list[str] = []
+
+    async def fake_llm_user_text(content: str, _max_tokens: int) -> str:
+        prompts.append(content)
+        return "## Key takeaways\n\n- x\n\n## Next actions\n\n- y\n"
+
+    monkeypatch.setattr(llm, "_llm_user_text", fake_llm_user_text)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+    asyncio.run(llm.llm_meeting_summary("A: hello", notebook="Owner: Bob, due Friday"))
+    asyncio.run(llm.llm_meeting_summary("A: hello"))
+    asyncio.run(llm.llm_meeting_summary("", notebook="Only my notes"))
+
+    assert "Owner: Bob, due Friday" in prompts[0] and "authoritative" in prompts[0]
+    assert "notebook" in prompts[1] and "<<<\n(none)\n>>>" in prompts[1]
+    assert "Only my notes" in prompts[2] and "(no transcript captured)" in prompts[2]
+
+
 def test_llm_meeting_summary_truncates_long_transcript(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -171,7 +192,7 @@ def test_app_save_schedules_async_summary_when_loop_running(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """LLM-configured + running loop -> placeholder first, then real summary written by task."""
-    import echo.app as app_mod
+    import echo.engine.session as app_mod
     from echo.app import EchoApp
 
     captured: dict[str, str] = {}
@@ -183,6 +204,7 @@ def test_app_save_schedules_async_summary_when_loop_running(
         meeting_title: str = "",
         meeting_context: str = "",
         dictionary_terms=(),
+        notebook: str = "",
     ) -> str:
         captured["transcript"] = transcript_text
         captured["title"] = meeting_title

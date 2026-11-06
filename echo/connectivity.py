@@ -89,3 +89,18 @@ def echo_llm_online() -> bool:
 def echo_connectivity_online() -> bool:
     """Deprecated alias: use :func:`echo_llm_online`."""
     return echo_llm_online()
+
+
+def probe_whisper_api() -> bool:
+    """Whether Whisper API credentials are set and the API host looks reachable."""
+    if _env_truthy("ECHO_OFFLINE"):
+        return False
+    if _env_truthy("ECHO_ASSUME_ONLINE"):
+        return True
+    from echo.asr_api import whisper_api_config
+
+    cfg = whisper_api_config()
+    if not cfg:
+        return False
+    base_url, _, _ = cfg
+    return _probe_openai_compatible_base(base_url)

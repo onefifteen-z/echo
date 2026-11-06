@@ -352,14 +352,21 @@ def _load_audio_mono_16k(path: Path):
             ) from e2
 
 
-def transcribe_mono16k_chunk(
+def _default_asr_language_from_env() -> str:
+    env_lang = (os.environ.get("ECHO_WHISPER_LANGUAGE") or "japanese").strip().lower() or "japanese"
+    if env_lang in ("japanese", "english", "chinese", "ja", "en", "zh"):
+        return env_lang
+    return "japanese"
+
+
+def _transcribe_local_whisper_chunk(
     samples: "object",
     *,
     model_id: str = MODEL_ID_DEFAULT,
     device: str | None = None,
     language: str = "japanese",
 ) -> str:
-    """Decode one mono float32 chunk at 16 kHz (Whisper). Returns empty string if too short."""
+    """Decode one mono float32 chunk at 16 kHz (local Kotoba-Whisper)."""
     import numpy as np
     import torch
 
@@ -375,10 +382,8 @@ def transcribe_mono16k_chunk(
         return ""
 
     ensure_model_loaded(model_id, device)
-    # Read the snapshot once so processor/model/device/dtype/max_length stay consistent
-    # even if another thread reloads while we are mid-decode.
     state = _state
-    assert state is not None  # ensure_model_loaded populates it
+    assert state is not None
 
     inputs = state.processor(x, sampling_rate=16000, return_tensors="pt")
     feats = inputs.input_features.to(state.device, dtype=state.dtype)
@@ -392,6 +397,20 @@ def transcribe_mono16k_chunk(
             max_length=state.max_length,
         )
     return state.processor.batch_decode(pred_ids, skip_special_tokens=True)[0].strip()
+
+
+def transcribe_mono16k_chunk(
+    samples: "object",
+    *,
+    model_id: str = MODEL_ID_DEFAULT,
+    device: str | None = None,
+    language: str | None = None,
+) -> str:
+    """Decode one mono float32 chunk at 16 kHz via the active ASR backend."""
+    from echo.asr_routing import get_router
+
+    lang = language if language is not None else _default_asr_language_from_env()
+    return get_router().transcribe_window(samples, language=lang)
 
 
 class TranscribeSession:
@@ -414,7 +433,11 @@ class TranscribeSession:
             raise RuntimeError("internal resample error")
         self._chunk_len = int(chunk_seconds * self._sr)
         self._index = 0
-        ensure_model_loaded(model_id, device)
+        from echo.asr_routing import get_router
+
+        router = get_router()
+        if router.active == "local_whisper" and not router.local_preloaded:
+            router.ensure_ready()
 
     def next_segment(self) -> tuple[float, float, str] | None:
         start = self._index * self._chunk_len
@@ -429,7 +452,6 @@ class TranscribeSession:
             chunk,
             model_id=self._model_id,
             device=self._device,
-            language="japanese",
         )
         self._index += 1
         return (start / self._sr, end / self._sr, text)

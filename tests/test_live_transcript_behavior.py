@@ -151,7 +151,7 @@ def test_live_vad_drops_chunk_below_threshold(monkeypatch) -> None:
 
     import numpy as np
 
-    import echo.app as app_mod
+    import echo.engine.text as app_mod
     import echo.audio_filters as af
     import echo.live_session as live_session_mod
     from echo.live_session import LiveTranscriptionSession
@@ -254,7 +254,7 @@ def test_live_denoise_runs_before_vad(monkeypatch) -> None:
 
     import numpy as np
 
-    import echo.app as app_mod
+    import echo.engine.text as app_mod
     import echo.audio_filters as af
     from echo.live_session import LiveTranscriptionSession
 
@@ -412,6 +412,9 @@ def test_should_trigger_insight_live_skips_on_pause_without_finalized() -> None:
 def test_render_asr_load_source_label() -> None:
     from echo.app import _render_asr_load_source_label
 
+    assert _render_asr_load_source_label("apple-on-device") == "Apple Speech (on-device)"
+    assert _render_asr_load_source_label("whisper-api") == "Whisper API (OpenAI-compatible)"
+    assert _render_asr_load_source_label("local-whisper") == "local Kotoba-Whisper"
     assert _render_asr_load_source_label("local-cache-only") == "local cache only (offline mode)"
     assert _render_asr_load_source_label("local-cache") == "local cache (no network fetch needed)"
     assert _render_asr_load_source_label("hub-fetch") == "network (Hugging Face Hub fallback)"
@@ -552,7 +555,8 @@ def test_run_echo_uses_live_specific_insight_defaults(monkeypatch) -> None:
     monkeypatch.setattr(asr, "ensure_model_loaded", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(app, "EchoApp", DummyEchoApp)
 
-    app.run_echo(live_audio=True, chunk_seconds=5.0)
+    monkeypatch.setattr("echo.asr_routing._local_deps_available", lambda: True)
+    app.run_echo(live_audio=True, chunk_seconds=5.0, asr_backend="local")
 
     assert captured["ran"] is True
     assert captured["insight_min_chars"] == 220
@@ -627,3 +631,130 @@ def test_pause_drain_quiescent_requires_empty_outq_and_no_pending_windows() -> N
     s._audio_blocks.clear()
     s._cap = None
     assert not s._pause_drain_quiescent()
+
+
+def _streaming_fake_app():
+    import asyncio
+    import time
+    from types import SimpleNamespace
+
+    from echo.app import TranscriptSegment
+
+    app = SimpleNamespace(
+        live_asr_language="japanese",
+        live_audio=True,
+        live_rewrite_stable_seconds=0.0,
+        insight_pause_seconds=0.0,
+        live_segment_pause_seconds=1.0,
+        ui_segment_max_chars=400,
+        ui_segment_max_seconds=60.0,
+        ui_segment_semantic_min_chars=4,
+        live_emit_interval=0.0,
+        asr_load_source="apple-on-device",
+        _paused=False,
+        _live_wall_t0=time.monotonic(),
+        _live_meter_note="",
+        _last_live_emitted_spoken="",
+        _force_live_insight_flush=False,
+        _lines=[],
+        _line_id_to_index={},
+        _line_id_to_spoken={},
+        _transcript_queue=asyncio.Queue(),
+        _debug_note=lambda _m: None,
+        _log_transcript_meta=lambda *_a, **_k: None,
+        _tick_header=lambda: None,
+    )
+
+    async def _emit(_log, line, *, spoken_text=None, allow_correction=True, **_kw):
+        line_id = len(app._lines)
+        app._line_id_to_index[line_id] = line_id
+        app._line_id_to_spoken[line_id] = spoken_text or ""
+        app._lines.append(line)
+        return TranscriptSegment(line_id, line, spoken_text or "", 0.0, allow_correction, False)
+
+    async def _refresh():
+        return None
+
+    app._emit_transcript_line = _emit
+    app._refresh_last_transcript_line = _refresh
+    return app
+
+
+def test_apple_streaming_partials_replace_draft_and_finals_commit(monkeypatch) -> None:
+    import asyncio
+    import time
+
+    import numpy as np
+
+    import echo.asr_apple as asr_apple
+    from echo.asr_apple import AppleStreamEvent
+    from echo.asr_routing import AsrRouter
+    from echo.live_session import LiveTranscriptionSession
+
+    script: list[list[AppleStreamEvent]] = []
+    fed: list[int] = []
+
+    class FakeRecognizer:
+        def __init__(self, language: str) -> None:
+            self.language = language
+            self.locale = "ja_JP"
+            self.alive = True
+
+        def start(self) -> None:
+            return None
+
+        def feed(self, samples) -> None:
+            fed.append(int(np.asarray(samples).size))
+
+        def poll(self):
+            return script.pop(0) if script else []
+
+        def finish(self, timeout: float = 0.0):
+            return []
+
+        def stop(self) -> None:
+            self.alive = False
+
+    monkeypatch.setattr(asr_apple, "AppleStreamingRecognizer", FakeRecognizer)
+    router = AsrRouter(
+        "auto",
+        apple_status=lambda _l: "installed",
+        api_usable=lambda: True,
+        api_configured=lambda: True,
+        platform="darwin",
+    )
+    router.select("japanese")
+
+    app = _streaming_fake_app()
+    s = LiveTranscriptionSession(app, log=None)
+    s._router = router
+
+    async def _run() -> None:
+        script.extend(
+            [
+                [AppleStreamEvent("partial", "本日の", 0.0, 0.5)],
+                [AppleStreamEvent("partial", "本日の会議", 0.0, 1.0)],
+                [AppleStreamEvent("final", "本日の会議です。", 0.0, 1.5)],
+            ]
+        )
+        for _ in range(3):
+            s._append_audio_block(np.zeros(1600, dtype=np.float32))
+            await s._async_run_buffered_asr_pass(None)
+        assert len(app._lines) == 1
+        assert app._lines[0].endswith("本日の会議です。")
+        s._last_voiced_wall = time.monotonic() - 5.0
+        await s._async_run_buffered_asr_pass(None)
+        finals = []
+        while not app._transcript_queue.empty():
+            seg = app._transcript_queue.get_nowait()
+            if seg.finalized:
+                finals.append(seg.spoken_text)
+        assert finals == ["本日の会議です。"]
+
+        script.append([AppleStreamEvent("partial", "次に", 3.0, 3.4)])
+        await s._async_run_buffered_asr_pass(None)
+        assert len(app._lines) == 2
+        assert app._lines[1].endswith("次に")
+
+    asyncio.run(_run())
+    assert sum(fed) == 3 * 1600

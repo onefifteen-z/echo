@@ -1,0 +1,33 @@
+{
+  "appId": "com.echo.app",
+  "productName": "Echo",
+  "directories": {
+    "output": "release"
+  },
+  "files": ["dist/**/*", "package.json"],
+  "extraResources": [
+    { "from": "../echo", "to": "python/echo", "filter": ["**/*", "!**/__pycache__/**"] },
+    { "from": "../pyproject.toml", "to": "python/pyproject.toml" },
+    { "from": "../README.md", "to": "python/README.md" },
+    { "from": "../AGENT.md", "to": "python/AGENT.md" }
+  ],
+  "mac": {
+    "target": "dmg",
+    "category": "public.app-category.productivity",
+    "hardenedRuntime": true,
+    "entitlements": "build/entitlements.mac.plist",
+    "entitlementsInherit": "build/entitlements.mac.plist",
+    "extendInfo": {
+      "NSMicrophoneUsageDescription": "Echo transcribes your meetings from the microphone.",
+      "NSSpeechRecognitionUsageDescription": "Echo uses Apple's on-device speech recognition to transcribe meetings.",
+      "NSAudioCaptureUsageDescription": "Echo records system audio (calls, videos) so it can be transcribed together with your microphone.",
+      "NSScreenCaptureUsageDescription": "Echo captures system audio through ScreenCaptureKit on macOS versions without system-audio-only capture."
+    }
+  },
+  "win": {
+    "target": "nsis"
+  },
+  "linux": {
+    "target": "AppImage"
+  }
+}

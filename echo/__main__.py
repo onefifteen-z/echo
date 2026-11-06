@@ -90,13 +90,25 @@ def main() -> None:
         "--chunk-seconds",
         type=float,
         default=None,
-        help="ASR window in seconds (default: 5 with --live, 30 with --audio).",
+        help=(
+            "ASR window in seconds (default with --live: 5, or ECHO_WHISPER_API_CHUNK_SECONDS=8 for the "
+            "Whisper API; 30 with --audio). Apple on-device live mode streams and ignores this."
+        ),
     )
     p.add_argument(
         "--whisper-device",
         choices=["cpu", "cuda", "mps"],
         default=None,
-        help="Force torch device for ASR (default: auto, or ECHO_WHISPER_DEVICE).",
+        help="Force torch device for local Kotoba ASR (default: auto, or ECHO_WHISPER_DEVICE).",
+    )
+    p.add_argument(
+        "--asr-backend",
+        choices=["auto", "apple", "api", "local"],
+        default=None,
+        help=(
+            "ASR backend: auto (Apple on-device → Whisper API → local Kotoba), "
+            "or force apple, api, or local. Default: ECHO_ASR_BACKEND or auto."
+        ),
     )
     p.add_argument(
         "--meeting-title",
@@ -110,7 +122,22 @@ def main() -> None:
         default=None,
         help="Meeting background/context. If omitted, Echo asks at startup.",
     )
+    p.add_argument(
+        "--install-apple-speech",
+        metavar="LANG",
+        default=None,
+        help="Download Apple's on-device speech model (macOS 26+) for ja, en, or zh, then exit.",
+    )
     args = p.parse_args()
+    if args.install_apple_speech:
+        from echo.app import install_apple_speech_cli
+
+        try:
+            install_apple_speech_cli(args.install_apple_speech)
+        except Exception as e:  # noqa: BLE001
+            print(f"\nEcho: Apple speech model download failed: {e}", file=sys.stderr)
+            raise SystemExit(1) from e
+        raise SystemExit(0)
     if args.list_audio_devices:
         from echo.live_audio import list_input_devices
 
@@ -127,9 +154,12 @@ def main() -> None:
     if args.live_system_authorized_cmd and not args.live_system_authorized:
         p.error("--live-system-authorized-cmd requires --live-system-authorized.")
 
+    from echo.preflight import enable_crash_log, run_preflight
+
+    enable_crash_log()
+    run_preflight(live=bool(args.live))
+
     chunk_seconds = args.chunk_seconds
-    if chunk_seconds is None:
-        chunk_seconds = 5.0 if args.live else 30.0
 
     live_mic: int | None = None
     live_sys: int | None = None
@@ -148,6 +178,7 @@ def main() -> None:
         model_id=args.model_id,
         chunk_seconds=chunk_seconds,
         whisper_device=args.whisper_device,
+        asr_backend=args.asr_backend,
         live_audio=args.live,
         live_mic_device=live_mic,
         live_system_device=live_sys,
