@@ -194,6 +194,7 @@ class MeetingStore:
             "meeting_title": meta["title"],
             "meeting_context": meta.get("context", ""),
             "notebook": _read(path / "notebook.md"),
+            "assets_dir": path / "notes-assets",
         }
 
     async def regenerate_summary(self, meeting_id: str, *, dictionary_terms: "object" = ()) -> str:

@@ -43,7 +43,7 @@ pip install -e .
 
 **Use a dedicated virtualenv, not a conda base env.** On Apple Silicon, macOS kills a process outright (`SIGKILL (Code Signature Invalid)`) when it loads a native extension whose arm64 signature is missing or modified. Long-lived conda base envs often contain such files (for example a modified `lib-dynload/_sqlite3`), and Echo imports several native modules lazily mid-session, so the symptom used to be a silent kill during a meeting plus mouse escape codes left in the terminal.
 
-- On startup, `echo-tui` imports the risky native modules in a child process first and exits with a message naming the broken module (`ECHO_SKIP_PREFLIGHT=1` disables this).
+- On startup, `echo-tui` and the desktop engine import the risky native modules in a child process first and exit with a message naming the broken module. A passing result is remembered per Python environment (`<venv>/.echo-preflight-ok`), so the check only runs again after packages or the interpreter change (`ECHO_SKIP_PREFLIGHT=1` disables it). The desktop engine pre-imports these modules in the background after it is ready.
 - Fatal-signal tracebacks are written to `./log/echo_crash_<timestamp>.log`.
 - `bin/echo-live` / `bin/echo-live-debug` prefer `.venv/bin/echo-tui` and restore the terminal on exit.
 - `echo-probe` reports the interpreter in use, arm64 signature problems, Apple speech model status, and a real Whisper API call.
@@ -373,6 +373,7 @@ Pressing `s` writes the current meeting to its output directory:
 | `meeting_context.md` | Meeting title and the background context entered at start. |
 | `summary.md` | **LLM-generated post-meeting summary** with two sections — `## Key takeaways` and `## Next actions`. |
 | `notebook.md` | Your own free-form notes (desktop app notebook; empty in the TUI). |
+| `notes-assets/` | Images pasted or dropped into the notebook (desktop app only). |
 | `insights.json` | Structured insight passes, used to regenerate the summary later. |
 | `meeting.json` | Metadata: id, title, context, start/end time, duration, mode, language, ASR backend, line count. |
 
@@ -386,7 +387,8 @@ markdown stub explaining how to enable it.
 
 An Electron + React + Tailwind front end (same stack as Lumina) that drives the Python engine through a local WebSocket sidecar (`echo-server`). It has a setup dialog (title, context, audio source, language, speech engine, microphone, Apple model download), live transcript with draft/final lines, level meter, status chips (ASR backend, mic-only warning, LLM availability), insights with collapsible web results, and meeting chat. Outputs go to `~/Documents/Echo/<YYYY-MM-DD HHMM> <title>/` by default (the folder can be changed in Settings; dated folders, so meetings with the same title never overwrite each other; the folder name is the meeting id).
 
-- **Notebook:** during a meeting, the *My notebook* tab (next to chat) is a Markdown notepad that autosaves into the session; it is written to `notebook.md` and included in the summary.
+- **Notebook:** during a meeting, the *My notebook* tab (next to chat) is a rich-text editor (headings, lists, checklists, tables; Markdown shortcuts such as `# ` and `- [ ] ` work) that autosaves into the session; it is written to `notebook.md` and included in the summary.
+  - **Images:** paste a screenshot, drag an image file in, or use *Image* in the toolbar (PNG, JPEG, GIF, WebP, up to 20 MB). Files are saved in the meeting folder under `notes-assets/` and linked from `notebook.md` as `![name](notes-assets/…)`. When the summary is generated (at the end of the meeting or with *Regenerate summary*), up to 8 notebook screenshots (the last ones, each under 3.75 MB) are sent to the LLM as images alongside the notes, so slides, whiteboards and shared documents count toward takeaways and next actions. If the model doesn't accept images, the summary is generated from text only and says so.
 - **Meetings view** (left rail): lists past meetings (newest first, searchable by title, context and summary) with date, duration, line count and summary preview. A meeting shows:
   - **Summary** with a *Regenerate summary* button (re-runs the LLM with transcript, insights, context and notebook).
   - **Notebook** (editable, autosaved).
@@ -396,6 +398,19 @@ An Electron + React + Tailwind front end (same stack as Lumina) that drives the 
   - *Delete* moves the folder to the macOS Trash, so it can be recovered.
   - The meeting in progress is marked **Live**: edits go to the running session, while regenerate and delete wait until the meeting ends.
 - Folders written by older versions (no `meeting.json`) are still listed, using the folder name as title and its modification time as date.
+- **Menu bar icon (macOS):**
+  - While a meeting runs, it shows the elapsed time and a recording dot; it shows *Paused* when paused.
+  - Its menu has the meeting status, *Open Echo*, *New meeting…*, *Pause* / *Resume*, *Stop meeting* and *Quit Echo*.
+  - Closing the window keeps Echo running in the Dock and the menu bar.
+  - On MacBooks with a notch, macOS hides menu bar icons that don't fit. If Echo's is missing, ⌘-drag it further right, or remove other menu bar items.
+- **Meeting detection (macOS 14+):** when the Zoom or Microsoft Teams desktop app starts using the microphone, Echo shows a floating *meeting detected* card in the top-right corner.
+  - *Start transcribing* starts right away with the source, engine, language and mic of your last meeting. The title comes from the meeting window, or falls back to "Zoom meeting 14:05".
+  - The chevron menu has *Set up first…* (opens the setup dialog with the title filled in), *Don't ask for Zoom/Teams* and *Turn off meeting detection*.
+  - The card closes by itself after 45 seconds, or when the meeting ends. It never takes focus from the meeting app, and it isn't shown while an Echo meeting is already running.
+  - Turn detection on or off, and re-enable muted apps, under **Settings → Meeting detection**.
+  - Requirements: the Xcode Command Line Tools (`xcode-select --install`). Echo compiles a small watcher helper the first time. Meeting titles need the **Screen Recording** permission; without it, the fallback title is used. Browser meetings (Zoom or Teams on the web) are not detected.
+  - Development: `ECHO_DEV_FAKE_ZOOM_BUNDLE=org.python.python npm run dev` treats any Python process using the mic as Zoom, so `python -c "import sounddevice"`-style captures can trigger the card.
+- **Editing a live meeting:** click the title in the top bar to rename it, and use *Context…* to edit the meeting context; changes are saved to the running session and its `meeting.json`.
 - **Settings view** (bottom of the left rail): edits the engine configuration for the desktop app.
   - **Groups:** Workspace (meetings folder, glossary file), Language model, Speech recognition (default engine, Whisper API, local device, Apple on-device model status with *Download*), Web search, Insights & transcript, Network & debugging.
   - **Advanced:** any other variable from the table above.
@@ -412,6 +427,9 @@ cd gui && npm install && npm run dev
 # Type-check / unit tests / production build / macOS package
 npm run typecheck && npm test && npm run build
 npm run package
+
+# Regenerate app icons (gui/assets/icons) after editing echo-icon.svg
+npm run icons
 ```
 
 - **Python runtime:** in development the app runs `../.venv/bin/python -m echo.server`. A packaged app bundles the `echo` sources and on first launch creates **`~/.echo/venv`** (needs Python ≥ 3.10, Homebrew preferred) and installs Echo into it; it is re-installed when the app version changes.

@@ -9,7 +9,7 @@
 
 import * as fs from "fs";
 import * as path from "path";
-import type { SettingsPatch, SettingsSnapshot } from "../../shared/types";
+import type { AppPrefs, MeetingApp, SettingsPatch, SettingsSnapshot } from "../../shared/types";
 
 export interface Cipher {
   available(): boolean;
@@ -23,6 +23,22 @@ interface SettingsFile {
   env: Record<string, string>;
   /** base64 ciphertext, or `plain:` + base64 when encryption is unavailable. */
   secrets: Record<string, string>;
+  prefs: AppPrefs;
+}
+
+const MEETING_APPS: MeetingApp[] = ["zoom", "teams"];
+
+function defaultPrefs(): AppPrefs {
+  return { meetingDetection: true, mutedApps: [], lastStart: null };
+}
+
+function normalizePrefs(raw: Partial<AppPrefs> | undefined): AppPrefs {
+  const p = { ...defaultPrefs(), ...(raw ?? {}) };
+  return {
+    meetingDetection: p.meetingDetection !== false,
+    mutedApps: [...new Set((Array.isArray(p.mutedApps) ? p.mutedApps : []).filter((a) => MEETING_APPS.includes(a)))],
+    lastStart: p.lastStart && typeof p.lastStart === "object" ? p.lastStart : null,
+  };
 }
 
 const KEY_RE = /^[A-Z][A-Z0-9_]*$/;
@@ -46,7 +62,7 @@ export function validateKey(key: string): string | null {
 }
 
 function empty(): SettingsFile {
-  return { version: 1, workspaceDir: null, env: {}, secrets: {} };
+  return { version: 1, workspaceDir: null, env: {}, secrets: {}, prefs: defaultPrefs() };
 }
 
 export class SettingsStore {
@@ -68,6 +84,7 @@ export class SettingsStore {
         workspaceDir: typeof raw.workspaceDir === "string" && raw.workspaceDir ? raw.workspaceDir : null,
         env: { ...(raw.env ?? {}) },
         secrets: { ...(raw.secrets ?? {}) },
+        prefs: normalizePrefs(raw.prefs),
       };
     } catch {
       return empty();
@@ -93,6 +110,7 @@ export class SettingsStore {
       env: { ...this.data.env },
       secretsSet: Object.keys(this.data.secrets).sort(),
       encryptionAvailable: this.cipher.available(),
+      prefs: { ...this.data.prefs, mutedApps: [...this.data.prefs.mutedApps] },
     };
   }
 
@@ -122,6 +140,17 @@ export class SettingsStore {
       }
     }
     this.data = next;
+    this.persist();
+    return this.snapshot();
+  }
+
+  prefs(): AppPrefs {
+    return this.snapshot().prefs;
+  }
+
+  /** Update app preferences (applied immediately; no engine restart). */
+  setPrefs(patch: Partial<AppPrefs>): SettingsSnapshot {
+    this.data = { ...this.data, prefs: normalizePrefs({ ...this.data.prefs, ...patch }) };
     this.persist();
     return this.snapshot();
   }

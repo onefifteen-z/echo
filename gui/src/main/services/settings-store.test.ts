@@ -99,3 +99,23 @@ describe("key helpers", () => {
     expect(validateKey("DYLD_INSERT_LIBRARIES")).not.toBeNull();
   });
 });
+
+describe("prefs", () => {
+  it("defaults, persists and normalizes preferences", () => {
+    const { file, make } = tmpStore();
+    const store = make();
+    expect(store.prefs()).toEqual({ meetingDetection: true, mutedApps: [], lastStart: null });
+    store.setPrefs({ mutedApps: ["zoom", "zoom", "bogus" as never] });
+    store.setPrefs({ lastStart: { source: "both", backend: "auto", language: "english", mic_device: null } });
+    const again = make().prefs();
+    expect(again.mutedApps).toEqual(["zoom"]);
+    expect(again.lastStart?.language).toBe("english");
+    expect(again.meetingDetection).toBe(true);
+    store.setPrefs({ meetingDetection: false });
+    expect(make().snapshot().prefs.meetingDetection).toBe(false);
+    // Env changes keep prefs.
+    store.apply({ env: { MODEL: "m" } });
+    expect(make().prefs().mutedApps).toEqual(["zoom"]);
+    expect(JSON.parse(fs.readFileSync(file, "utf-8")).prefs.meetingDetection).toBe(false);
+  });
+});

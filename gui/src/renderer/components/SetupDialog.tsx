@@ -5,12 +5,13 @@ import { appleLocaleState, Button, LANGUAGE_LABELS } from "./ui";
 
 interface Props {
   busy: boolean;
+  initialTitle?: string;
   appleInstall: AppleInstallView | null;
   onStart: (args: SessionStartArgs) => Promise<void>;
 }
 
-export function SetupDialog({ busy, appleInstall, onStart }: Props) {
-  const [title, setTitle] = useState("");
+export function SetupDialog({ busy, initialTitle = "", appleInstall, onStart }: Props) {
+  const [title, setTitle] = useState(initialTitle);
   const [context, setContext] = useState("");
   const [source, setSource] = useState<AudioSource>("both");
   const [backend, setBackend] = useState<AsrBackendChoice>("auto");
@@ -27,11 +28,17 @@ export function SetupDialog({ busy, appleInstall, onStart }: Props) {
     window.echo.invoke("probe", {}).then(setProbe).catch(() => undefined);
     window.echo
       .getSettings()
-      .then((s) => setWorkspace(s.workspaceDir.replace(/^\/Users\/[^/]+/, "~")))
-      .catch(() => undefined);
-    window.echo
-      .invoke("config.effective", { keys: ["ECHO_ASR_BACKEND"] })
-      .then((r) => {
+      .then(async (s) => {
+        setWorkspace(s.workspaceDir.replace(/^\/Users\/[^/]+/, "~"));
+        const last = s.prefs.lastStart;
+        if (last) {
+          setSource(last.source);
+          setBackend(last.backend);
+          setLanguage(last.language);
+          setMicDevice(last.mic_device ?? null);
+          return;
+        }
+        const r = await window.echo.invoke("config.effective", { keys: ["ECHO_ASR_BACKEND"] });
         const v = (r.ECHO_ASR_BACKEND?.value ?? "").trim().toLowerCase();
         if (v === "auto" || v === "apple" || v === "api" || v === "local") setBackend(v);
       })

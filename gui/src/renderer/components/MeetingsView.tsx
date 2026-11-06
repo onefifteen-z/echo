@@ -284,8 +284,10 @@ export function MeetingsView({ refreshKey, selectId, onOpenLive, toast }: Props)
             {tab === "notebook" && (
               <NotebookEditor
                 docKey={detail.id}
+                meetingId={detail.id}
                 initial={detail.notebook_md}
                 onSave={(text) => update({ notebook: text })}
+                onError={(message) => toast(message, "error")}
               />
             )}
             {tab === "transcript" && (

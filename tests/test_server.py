@@ -61,6 +61,8 @@ def test_demo_session_broadcasts_events(monkeypatch: pytest.MonkeyPatch, tmp_pat
     msgs = asyncio.run(go())
     finals = [m["event"] for m in msgs if m["event"]["type"] == "transcript.final"]
     assert len(finals) >= 1
+    statuses = [m["event"] for m in msgs if m["event"]["type"] == "status"]
+    assert statuses[-1]["state"] == "stopped"
     (folder,) = [p for p in tmp_path.iterdir() if p.is_dir()]
     assert folder.name.endswith(" untitled-meeting")
     assert (folder / "notes.txt").exists()
@@ -71,10 +73,20 @@ def test_demo_session_broadcasts_events(monkeypatch: pytest.MonkeyPatch, tmp_pat
 def test_meetings_commands_and_live_notebook(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     monkeypatch.setattr("echo.connectivity.echo_llm_online", lambda: False)
     s = EchoServer("t", output_root=tmp_path)
+    client_q: asyncio.Queue[str] = asyncio.Queue()
+    s._clients["c"] = client_q
 
     async def call(q: asyncio.Queue[str], n: int, cmd: str, args: dict | None = None) -> dict:
         await s._dispatch(q, json.dumps({"id": n, "cmd": cmd, "args": args or {}}))
         return json.loads(q.get_nowait())
+
+    def status_titles() -> list[str]:
+        out = []
+        while not client_q.empty():
+            ev = json.loads(client_q.get_nowait())["event"]
+            if ev["type"] == "status":
+                out.append(ev["meeting_title"])
+        return out
 
     async def go() -> None:
         q: asyncio.Queue[str] = asyncio.Queue()
@@ -90,12 +102,16 @@ def test_meetings_commands_and_live_notebook(monkeypatch: pytest.MonkeyPatch, tm
 
         r = await call(q, 4, "meetings.regenerate_summary", {"id": live_id})
         assert r["ok"] is False and "End the meeting first" in r["error"]
-        r = await call(q, 5, "meetings.update", {"id": live_id, "title": "Budget sync"})
+        status_titles()
+        r = await call(q, 5, "meetings.update", {"id": live_id, "title": "Budget sync", "context": "Q3 numbers"})
         assert r["ok"] and r["result"]["title"] == "Budget sync" and s.session.meeting_title == "Budget sync"
+        assert r["result"]["context"] == "Q3 numbers" and s.session.meeting_context == "Q3 numbers"
+        assert "Budget sync" in status_titles()
+        assert s.session.output_dir.name == live_id
 
         await call(q, 6, "session.stop")
         detail = (await call(q, 7, "meetings.get", {"id": live_id}))["result"]
-        assert detail["live"] is False and detail["title"] == "Budget sync"
+        assert detail["live"] is False and detail["title"] == "Budget sync" and detail["context"] == "Q3 numbers"
         assert detail["notebook_md"] == "- decide budget"
 
         r = await call(q, 8, "meetings.update", {"id": live_id, "notebook": "edited", "context": "Q3"})

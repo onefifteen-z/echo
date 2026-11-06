@@ -6,7 +6,13 @@ interface Props {
   items: ChatItem[];
   disabled: boolean;
   onAsk: (q: string) => void;
-  notebook: { docKey: string; initial: string; onSave: (text: string) => Promise<unknown> };
+  notebook: {
+    docKey: string;
+    meetingId: string | null;
+    initial: string;
+    onSave: (text: string) => Promise<unknown>;
+    onError?: (message: string) => void;
+  };
 }
 
 export function ChatNotebookPanel({ items, disabled, onAsk, notebook }: Props) {
@@ -69,9 +75,11 @@ export function ChatNotebookPanel({ items, disabled, onAsk, notebook }: Props) {
       <div className={tab === "notebook" ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
         <NotebookEditor
           docKey={notebook.docKey}
+          meetingId={notebook.meetingId}
           initial={notebook.initial}
           onSave={notebook.onSave}
-          placeholder="Your own notes during the meeting (Markdown). Included in the summary."
+          onError={notebook.onError}
+          placeholder="Your own notes during the meeting. Paste or drop images here. Included in the summary."
         />
       </div>
     </section>

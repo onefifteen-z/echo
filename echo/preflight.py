@@ -10,9 +10,11 @@ first and report which module is at fault.
 from __future__ import annotations
 
 import faulthandler
+import hashlib
 import os
 import subprocess
 import sys
+import sysconfig
 import time
 from pathlib import Path
 
@@ -101,13 +103,53 @@ def warm_imports(modules: tuple[str, ...]) -> None:
             pass
 
 
-def run_preflight(*, live: bool) -> None:
-    """Exit with a clear message when the env would crash mid-session; otherwise warm imports."""
+def preflight_modules(*, live: bool) -> tuple[str, ...]:
+    return LAZY_NATIVE_MODULES + (LIVE_NATIVE_MODULES if live else ())
+
+
+def _marker_path() -> Path:
+    return Path(sys.prefix) / ".echo-preflight-ok"
+
+
+def _preflight_key(modules: tuple[str, ...]) -> str:
+    """Changes whenever the interpreter or the installed packages change (pip touches site-packages)."""
+    try:
+        site_mtime = os.stat(sysconfig.get_paths()["purelib"]).st_mtime_ns
+    except OSError:
+        site_mtime = 0
+    raw = "\n".join([sys.executable, sys.version, ",".join(modules), str(site_mtime)])
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _passed_before(key: str) -> bool:
+    try:
+        return _marker_path().read_text(encoding="utf-8").strip() == key
+    except OSError:
+        return False
+
+
+def _remember_pass(key: str) -> None:
+    try:
+        _marker_path().write_text(key, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def run_preflight(*, live: bool, warm: bool = True) -> None:
+    """Exit with a clear message when the env would crash mid-session; otherwise warm imports.
+
+    The child-process check runs once per environment state; a passing result is remembered in
+    ``<sys.prefix>/.echo-preflight-ok``. With ``warm=False`` the caller warms imports itself.
+    """
     if os.environ.get("ECHO_SKIP_PREFLIGHT", "").strip().lower() in ("1", "true", "yes"):
         return
-    modules = LAZY_NATIVE_MODULES + (LIVE_NATIVE_MODULES if live else ())
-    ok, msg = check_imports_in_child(modules)
-    if not ok:
-        print(f"Echo: environment check failed.\n{msg}", file=sys.stderr, flush=True)
-        raise SystemExit(3)
-    warm_imports(modules)
+    modules = preflight_modules(live=live)
+    key = _preflight_key(modules)
+    if not _passed_before(key):
+        ok, msg = check_imports_in_child(modules)
+        if not ok:
+            print(f"Echo: environment check failed.\n{msg}", file=sys.stderr, flush=True)
+            raise SystemExit(3)
+        _remember_pass(key)
+    if warm:
+        warm_imports(modules)

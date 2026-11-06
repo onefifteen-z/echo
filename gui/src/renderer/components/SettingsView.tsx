@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { EffectiveValue, Language, ProbeResult, SettingsPatch, SettingsSnapshot } from "@shared/types";
+import type {
+  EffectiveValue,
+  Language,
+  MeetingApp,
+  MeetingWatchStatus,
+  ProbeResult,
+  SettingsPatch,
+  SettingsSnapshot,
+} from "@shared/types";
 import type { AppleInstallView } from "../lib/session-store";
 import {
   CURATED_KEYS,
@@ -28,6 +36,79 @@ const field = "w-full rounded-md border border-line bg-panel-2 px-3 py-1.5 text-
 
 function errorText(e: unknown): string {
   return (e instanceof Error ? e.message : String(e)).replace(/^Error invoking remote method '[^']+': (Error: )?/, "");
+}
+
+const MEETING_APP_NAMES: Record<MeetingApp, string> = { zoom: "Zoom", teams: "Microsoft Teams" };
+
+function MeetingDetectionSection({
+  snap,
+  onChange,
+  toast,
+}: {
+  snap: SettingsSnapshot;
+  onChange: (s: SettingsSnapshot) => void;
+  toast: (text: string, tone?: "info" | "error") => void;
+}) {
+  const [watch, setWatch] = useState<MeetingWatchStatus | null>(null);
+  useEffect(() => {
+    void window.echo.getMeetingWatch().then(setWatch);
+    return window.echo.onMeetingWatchStatus(setWatch);
+  }, []);
+  const prefs = snap.prefs;
+  const set = (patch: Parameters<typeof window.echo.setPrefs>[0]) =>
+    window.echo
+      .setPrefs(patch)
+      .then(onChange)
+      .catch((e) => toast(errorText(e), "error"));
+  const watchLabel: Record<MeetingWatchStatus["state"], string> = {
+    running: "Watching",
+    starting: "Starting…",
+    stopped: "Off",
+    unavailable: "Unavailable",
+  };
+
+  return (
+    <section className="rounded-lg border border-line bg-panel px-5 py-4">
+      <h2 className="text-xs font-semibold tracking-wide text-zinc-400 uppercase">Meeting detection</h2>
+      <p className="mt-1 text-xs text-zinc-500">
+        When Zoom or Microsoft Teams starts using the microphone, Echo shows a prompt to start transcribing with your
+        last-used capture settings. Meeting names are read from window titles when Screen Recording access is granted.
+      </p>
+      <div className="mt-3 space-y-3">
+        <label className="flex items-center gap-3 text-sm text-zinc-200">
+          <input
+            type="checkbox"
+            className="h-4 w-4 accent-[var(--color-accent)]"
+            checked={prefs.meetingDetection}
+            onChange={(e) => void set({ meetingDetection: e.target.checked })}
+          />
+          Offer to transcribe Zoom and Teams meetings
+          {watch && (
+            <Chip tone={watch.state === "running" ? "ok" : watch.state === "unavailable" ? "warn" : "neutral"} title={watch.message}>
+              {watchLabel[watch.state]}
+            </Chip>
+          )}
+        </label>
+        {watch?.state === "unavailable" && watch.message && <p className="text-xs text-amber-300">{watch.message}</p>}
+        {prefs.mutedApps.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2 text-sm text-zinc-400">
+            Not asking for:
+            {prefs.mutedApps.map((app) => (
+              <span key={app} className="flex items-center gap-1.5 rounded-full border border-line px-2.5 py-0.5 text-xs text-zinc-300">
+                {MEETING_APP_NAMES[app]}
+                <button
+                  className="no-drag text-zinc-500 underline hover:text-zinc-200"
+                  onClick={() => void set({ mutedApps: prefs.mutedApps.filter((a) => a !== app) })}
+                >
+                  Ask again
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
+  );
 }
 
 function SourceBadge({ source }: { source: "app" | "env" | "default" | "pending" }) {
@@ -349,6 +430,8 @@ export function SettingsView({ engineReady, liveRunning, appleInstall, endLive, 
               </div>
             </section>
           ))}
+
+          <MeetingDetectionSection snap={snap} onChange={setSnap} toast={toast} />
 
           <section className="rounded-lg border border-line bg-panel px-5 py-4">
             <h2 className="text-xs font-semibold tracking-wide text-zinc-400 uppercase">Advanced</h2>

@@ -108,6 +108,93 @@ def test_llm_meeting_summary_includes_notebook(monkeypatch: pytest.MonkeyPatch) 
     assert "Only my notes" in prompts[2] and "(no transcript captured)" in prompts[2]
 
 
+def test_notebook_images_are_replaced_in_summary_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    import echo.llm as llm
+
+    assert llm.notebook_for_prompt("a ![Whiteboard](notes-assets/img-1.png) b") == "a [image: Whiteboard] b"
+    assert llm.notebook_for_prompt("![](notes-assets/img-2.jpg)") == "[image]"
+    assert llm.notebook_for_prompt("![logo](https://x.test/a.png)") == "![logo](https://x.test/a.png)"
+
+    prompts: list[str] = []
+
+    async def fake_llm_user_text(content: str, _max_tokens: int) -> str:
+        prompts.append(content)
+        return "## Key takeaways\n\n- x\n\n## Next actions\n\n- y\n"
+
+    monkeypatch.setattr(llm, "_llm_user_text", fake_llm_user_text)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    asyncio.run(llm.llm_meeting_summary("A: hi", notebook="Plan\n\n![Board](notes-assets/img-3.png)"))
+    assert "[image: Board]" in prompts[0] and "notes-assets/" not in prompts[0]
+
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+
+
+def test_notebook_with_images_loads_numbers_and_skips(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import echo.llm as llm
+
+    assets = tmp_path / "notes-assets"
+    assets.mkdir()
+    for name in ("a.png", "b.jpg", "big.png"):
+        (assets / name).write_bytes(PNG_BYTES)
+    monkeypatch.setattr(llm, "_SUMMARY_MAX_IMAGE_BYTES", len(PNG_BYTES))
+    (assets / "big.png").write_bytes(PNG_BYTES + b"x")
+    md = "![Slide](notes-assets/a.png)\n![](notes-assets/missing.png)\n![Big](notes-assets/big.png)\n![Board](notes-assets/b.jpg)\n![Esc](notes-assets/../x.png)"
+    text, images = llm.notebook_with_images(md, assets)
+    assert text.splitlines() == ["[image 1: Slide]", "[image]", "[image: Big]", "[image 2: Board]", "[image: Esc]"]
+    assert [(i.label, i.media_type) for i in images] == [("[image 1: Slide]", "image/png"), ("[image 2: Board]", "image/jpeg")]
+    assert llm.notebook_with_images(md, None) == (llm.notebook_for_prompt(md), [])
+
+    monkeypatch.setattr(llm, "_SUMMARY_MAX_IMAGES", 1)
+    text, images = llm.notebook_with_images(md, assets)
+    assert [i.label for i in images] == ["[image 1: Board]"] and "[image: Slide]" in text
+
+
+def test_image_content_blocks_per_provider() -> None:
+    import echo.llm as llm
+
+    img = llm.PromptImage(label="[image 1: Slide]", media_type="image/png", data_b64="QUJD")
+    assert llm._anthropic_content("prompt", None) == "prompt"
+    blocks = llm._anthropic_content("prompt", [img])
+    assert blocks[1] == {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}
+    assert blocks[-1] == {"type": "text", "text": "prompt"}
+    parts = llm._openai_content("prompt", [img])
+    assert parts[0] == {"type": "text", "text": "prompt"}
+    assert parts[2] == {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}
+
+
+def test_meeting_summary_attaches_screenshots_and_falls_back(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import echo.llm as llm
+
+    assets = tmp_path / "notes-assets"
+    assets.mkdir()
+    (assets / "s.png").write_bytes(PNG_BYTES)
+    calls: list[tuple[str, int]] = []
+    reject = {"on": False}
+
+    async def fake_llm_user_text(content: str, _max_tokens: int, images=None) -> str:
+        calls.append((content, len(images or [])))
+        if images and reject["on"]:
+            raise RuntimeError("model does not support images")
+        return "## Key takeaways\n\n- x\n\n## Next actions\n\n- y\n"
+
+    monkeypatch.setattr(llm, "_llm_user_text", fake_llm_user_text)
+    monkeypatch.setattr(llm, "_LLM_USER_TEXT_BACKOFF_S", 0)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    notebook = "Revenue slide:\n\n![Q3](notes-assets/s.png)"
+
+    md = asyncio.run(llm.llm_meeting_summary("A: hi", notebook=notebook, assets_dir=assets))
+    assert calls[0][1] == 1 and "[image 1: Q3]" in calls[0][0] and "1 screenshot(s)" in calls[0][0]
+    assert "text only" not in md
+
+    calls.clear()
+    reject["on"] = True
+    md = asyncio.run(llm.llm_meeting_summary("A: hi", notebook=notebook, assets_dir=assets))
+    assert [n for _c, n in calls] == [1, 1, 0]
+    assert "[image: Q3]" in calls[-1][0] and "screenshot(s)" not in calls[-1][0]
+    assert md.startswith("## Key takeaways") and "text only" in md
+
+
 def test_llm_meeting_summary_truncates_long_transcript(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -205,6 +292,7 @@ def test_app_save_schedules_async_summary_when_loop_running(
         meeting_context: str = "",
         dictionary_terms=(),
         notebook: str = "",
+        assets_dir=None,
     ) -> str:
         captured["transcript"] = transcript_text
         captured["title"] = meeting_title

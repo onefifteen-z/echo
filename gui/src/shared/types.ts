@@ -109,6 +109,15 @@ export interface MeetingUpdate {
   notebook?: string;
 }
 
+/** Capture settings reused by "Start transcribing" in the meeting prompt. */
+export type LastStart = Pick<SessionStartArgs, "source" | "backend" | "language" | "mic_device">;
+
+export interface AppPrefs {
+  meetingDetection: boolean;
+  mutedApps: MeetingApp[];
+  lastStart: LastStart | null;
+}
+
 export interface SettingsSnapshot {
   workspaceDir: string;
   defaultWorkspaceDir: string;
@@ -118,6 +127,7 @@ export interface SettingsSnapshot {
   /** Secret keys that have a stored (encrypted) value; values are never sent to the renderer. */
   secretsSet: string[];
   encryptionAvailable: boolean;
+  prefs: AppPrefs;
 }
 
 export interface SettingsPatch {
@@ -189,11 +199,56 @@ export const IPC = {
   restartSidecar: "echo:restart-sidecar",
   openPath: "echo:open-path",
   trashMeeting: "echo:trash-meeting",
+  saveNoteImage: "echo:save-note-image",
   getSettings: "echo:settings-get",
   saveSettings: "echo:settings-save",
   chooseDir: "echo:choose-dir",
   chooseFile: "echo:choose-file",
+  trayCommand: "echo:tray-command",
+  sessionAttached: "echo:session-attached",
+  setPrefs: "echo:settings-set-prefs",
+  getMeetingWatch: "echo:meeting-watch-get",
+  meetingWatchStatus: "echo:meeting-watch-status",
+  takePendingCommand: "echo:take-pending-command",
 } as const;
+
+export type MeetingApp = "zoom" | "teams";
+
+export interface MeetingWatchStatus {
+  state: "stopped" | "starting" | "running" | "unavailable";
+  message?: string;
+}
+
+/** Sent to the main window by the menu bar item and the meeting prompt. */
+export type TrayCommand = { kind: "stop" } | { kind: "new"; title?: string };
+
+export interface MeetingPromptData {
+  app: MeetingApp;
+  appName: string;
+  title: string;
+}
+
+export type MeetingPromptAction =
+  | "start"
+  | "setup"
+  | "mute"
+  | "disable"
+  | "menu-open"
+  | "menu-close"
+  | "dismiss"
+  | "hover-start"
+  | "hover-end";
+
+/** Channels of the meeting prompt window (its own minimal preload). */
+export const PROMPT_IPC = {
+  show: "echo-prompt:show",
+  act: "echo-prompt:act",
+} as const;
+
+export interface EchoPromptAPI {
+  onShow(cb: (data: MeetingPromptData) => void): () => void;
+  act(action: MeetingPromptAction): void;
+}
 
 export interface EchoAPI {
   invoke<K extends CommandName>(cmd: K, args: CommandMap[K][0]): Promise<CommandMap[K][1]>;
@@ -211,9 +266,19 @@ export interface EchoAPI {
   openPath(path: string): Promise<void>;
   /** Move a saved meeting folder to the system Trash (refused for the meeting in progress). */
   trashMeeting(id: string): Promise<void>;
+  /** Save an image into the meeting's `notes-assets/` folder; returns the Markdown-relative `src`. */
+  saveNoteImage(meetingId: string, bytes: Uint8Array, mime: string): Promise<{ src: string }>;
   getSettings(): Promise<SettingsSnapshot>;
   /** Persist settings; with `restart`, the engine restarts so the new environment takes effect. */
   saveSettings(patch: SettingsPatch, opts: { restart: boolean }): Promise<SettingsSnapshot>;
   chooseDir(current?: string): Promise<string | null>;
   chooseFile(current?: string): Promise<string | null>;
+  onTrayCommand(cb: (cmd: TrayCommand) => void): () => void;
+  /** Command queued while the window was (re)loading, if any. */
+  takePendingCommand(): Promise<TrayCommand | null>;
+  /** A session was started outside the window (meeting prompt); re-read `session.snapshot`. */
+  onSessionAttached(cb: () => void): () => void;
+  setPrefs(patch: Partial<AppPrefs>): Promise<SettingsSnapshot>;
+  getMeetingWatch(): Promise<MeetingWatchStatus>;
+  onMeetingWatchStatus(cb: (s: MeetingWatchStatus) => void): () => void;
 }

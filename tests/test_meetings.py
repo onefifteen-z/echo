@@ -85,12 +85,15 @@ def test_regenerate_summary_passes_notebook_and_insights(tmp_path: Path, monkeyp
     d = _new_meeting(tmp_path, mid, started="2026-11-06T10:00:00+09:00", notebook="Bob owns rollout")
     seen: dict = {}
 
-    async def fake_summary(transcript_text, *, insight_passes=None, meeting_title="", meeting_context="", dictionary_terms=(), notebook=""):
+    async def fake_summary(
+        transcript_text, *, insight_passes=None, meeting_title="", meeting_context="", dictionary_terms=(), notebook="", assets_dir=None
+    ):
         seen.update(
             transcript=transcript_text,
             insight_passes=insight_passes,
             meeting_title=meeting_title,
             notebook=notebook,
+            assets_dir=assets_dir,
         )
         return "## Key takeaways\n\n- new\n"
 
@@ -98,6 +101,7 @@ def test_regenerate_summary_passes_notebook_and_insights(tmp_path: Path, monkeyp
     md = asyncio.run(MeetingStore(tmp_path).regenerate_summary(mid))
     assert md.endswith("- new\n") and (d / "summary.md").read_text(encoding="utf-8") == md
     assert seen["notebook"] == "Bob owns rollout"
+    assert seen["assets_dir"] == d / "notes-assets"
     assert seen["insight_passes"] == [("comment", "Decide")]
     assert seen["meeting_title"] == "Weekly" and "hello" in seen["transcript"]
 

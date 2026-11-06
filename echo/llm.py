@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -206,7 +207,7 @@ def _get_anthropic_client(api_key: str) -> Any:
 async def _openai_chat_completions(
     api_key: str,
     model: str,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     max_tokens: int,
     *,
     base_url: str | None = None,
@@ -360,7 +361,7 @@ Participant's own notebook (typed by the user during / after the meeting). Treat
 <<<
 <<<NOTEBOOK>>>
 >>>
-
+<<<NOTEBOOK_IMAGES>>>
 Live insight comments captured during the meeting (each was produced from one transcript chunk; may be redundant or partly out of date):
 <<<
 <<<INSIGHTS>>>
@@ -380,9 +381,9 @@ Output rules:
   - 3 to 7 short bullets. Each starts with a **bold lead phrase** stating the point, then one short sentence of support grounded in the transcript / live insights. No questions, no fluff. If something is uncertain, mark it `(unconfirmed)`.
 
   ## Next actions
-  - 2 to 7 short bullets. Each bullet is **one concrete action**: who (if known) → what → by when (if mentioned). If owner / due date is unclear, write `owner: unclear` / `due: unclear` instead of guessing. If no actions were discussed, write a single bullet: `- No explicit next actions were agreed in this meeting.`
+  - 2 to 7 short bullets. Each bullet is **one concrete action**: who (if known) → what → by when (if mentioned). Never guess an owner or due date; when one is not known, simply leave it out — do **not** write placeholders such as `owner: unclear`, `due: unclear`, "TBD" or "not specified". If no actions were discussed, write a single bullet: `- No explicit next actions were agreed in this meeting.`
 
-- **Hard cap ~250 words total** across both sections. No section may be empty (use the unclear / no-action fallback if needed).
+- **Hard cap ~250 words total** across both sections. No section may be empty (use the no-action fallback if needed).
 - Do **not** include long quotations from the transcript; paraphrase tightly.
 """
 
@@ -426,14 +427,35 @@ def _hits_bullets(hits: list[SearchHit]) -> str:
     return "\n".join(lines)
 
 
-async def _llm_user_text(content: str, max_tokens: int) -> str:
+async def _llm_user_text(content: str, max_tokens: int, images: list[PromptImage] | None = None) -> str:
     if key := os.environ.get("ANTHROPIC_API_KEY"):
-        return await _anthropic_user_text(key, content, max_tokens)
+        return await _anthropic_user_text(key, content, max_tokens, images)
     if cfg := _litellm_openai_config():
-        return await _openai_compatible_user_text(cfg, content, max_tokens)
+        return await _openai_compatible_user_text(cfg, content, max_tokens, images)
     if key := os.environ.get("OPENAI_API_KEY"):
-        return await _openai_user_text(key, content, max_tokens)
+        return await _openai_user_text(key, content, max_tokens, images)
     return ""
+
+
+def _anthropic_content(content: str, images: list[PromptImage] | None) -> str | list[dict[str, Any]]:
+    if not images:
+        return content
+    blocks: list[dict[str, Any]] = []
+    for img in images:
+        blocks.append({"type": "text", "text": img.label})
+        blocks.append({"type": "image", "source": {"type": "base64", "media_type": img.media_type, "data": img.data_b64}})
+    blocks.append({"type": "text", "text": content})
+    return blocks
+
+
+def _openai_content(content: str, images: list[PromptImage] | None) -> str | list[dict[str, Any]]:
+    if not images:
+        return content
+    parts: list[dict[str, Any]] = [{"type": "text", "text": content}]
+    for img in images:
+        parts.append({"type": "text", "text": img.label})
+        parts.append({"type": "image_url", "image_url": {"url": f"data:{img.media_type};base64,{img.data_b64}"}})
+    return parts
 
 
 # Three attempts (1 initial + 2 retries). Providers occasionally return an empty body
@@ -449,6 +471,7 @@ async def _llm_user_text_with_retry(
     max_tokens: int,
     *,
     attempts: int = _LLM_USER_TEXT_ATTEMPTS,
+    images: list[PromptImage] | None = None,
 ) -> tuple[str, str | None]:
     """Call `_llm_user_text` with retries.
 
@@ -466,7 +489,11 @@ async def _llm_user_text_with_retry(
     last_error: str | None = None
     for i in range(max(1, attempts)):
         try:
-            text = await _llm_user_text(content, max_tokens)
+            text = (
+                await _llm_user_text(content, max_tokens, images)
+                if images
+                else await _llm_user_text(content, max_tokens)
+            )
         except Exception as e:  # noqa: BLE001 - surface any backend error uniformly
             last_error = repr(e)
         else:
@@ -480,12 +507,14 @@ async def _llm_user_text_with_retry(
     return "", last_error or "empty"
 
 
-async def _anthropic_user_text(api_key: str, content: str, max_tokens: int) -> str:
+async def _anthropic_user_text(
+    api_key: str, content: str, max_tokens: int, images: list[PromptImage] | None = None
+) -> str:
     client = _get_anthropic_client(api_key)
     msg = await client.messages.create(
         model=os.environ.get("ECHO_ANTHROPIC_MODEL", "claude-3-5-haiku-20241022"),
         max_tokens=max_tokens,
-        messages=[{"role": "user", "content": content}],
+        messages=[{"role": "user", "content": _anthropic_content(content, images)}],
     )
     return "".join(b.text for b in msg.content if getattr(b, "text", None)).strip()
 
@@ -494,23 +523,26 @@ async def _openai_compatible_user_text(
     cfg: tuple[str, str, str],
     content: str,
     max_tokens: int,
+    images: list[PromptImage] | None = None,
 ) -> str:
     base_url, api_key, model = cfg
     return await _openai_chat_completions(
         api_key,
         model,
-        [{"role": "user", "content": content}],
+        [{"role": "user", "content": _openai_content(content, images)}],
         max_tokens,
         base_url=base_url,
     )
 
 
-async def _openai_user_text(api_key: str, content: str, max_tokens: int) -> str:
+async def _openai_user_text(
+    api_key: str, content: str, max_tokens: int, images: list[PromptImage] | None = None
+) -> str:
     model = os.environ.get("ECHO_OPENAI_MODEL", "gpt-4o-mini")
     return await _openai_chat_completions(
         api_key,
         model,
-        [{"role": "user", "content": content}],
+        [{"role": "user", "content": _openai_content(content, images)}],
         max_tokens,
     )
 
@@ -720,6 +752,68 @@ MEETING_SUMMARY_OFFLINE_MARKDOWN = (
 )
 
 
+_NOTEBOOK_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(\s*<?(notes-assets/[^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)")
+_IMAGE_MEDIA_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
+_SUMMARY_MAX_IMAGES = 8
+# Anthropic rejects images over 5 MB once base64-encoded.
+_SUMMARY_MAX_IMAGE_BYTES = 3_750_000
+
+
+@dataclass
+class PromptImage:
+    label: str
+    media_type: str
+    data_b64: str
+
+
+def _image_label(alt: str, n: int | None = None) -> str:
+    alt = alt.strip()
+    head = f"image {n}" if n is not None else "image"
+    return f"[{head}: {alt}]" if alt else f"[{head}]"
+
+
+def notebook_for_prompt(text: str) -> str:
+    """Replace notebook image embeds (``![alt](notes-assets/...)``) with ``[image: alt]``."""
+    return _NOTEBOOK_IMAGE_RE.sub(lambda m: _image_label(m.group(1)), text)
+
+
+def notebook_with_images(text: str, assets_dir: Path | None) -> tuple[str, list[PromptImage]]:
+    """Load the screenshots a notebook embeds (the last ``_SUMMARY_MAX_IMAGES`` readable ones).
+
+    Attached images are referenced in the text as ``[image N: alt]`` (N matches the attachment
+    order); the rest, and any that are missing or too large, become ``[image: alt]``.
+    """
+    if assets_dir is None:
+        return notebook_for_prompt(text), []
+    loaded: dict[int, tuple[str, str]] = {}
+    for m in _NOTEBOOK_IMAGE_RE.finditer(text):
+        name = m.group(2).split("/", 1)[1]
+        media_type = _IMAGE_MEDIA_TYPES.get(Path(name).suffix.lower())
+        path = assets_dir / name
+        if not media_type or "/" in name or "\\" in name:
+            continue
+        try:
+            if path.stat().st_size > _SUMMARY_MAX_IMAGE_BYTES:
+                continue
+            data = path.read_bytes()
+        except OSError:
+            continue
+        loaded[m.start()] = (media_type, base64.b64encode(data).decode("ascii"))
+    keep = sorted(loaded)[-_SUMMARY_MAX_IMAGES:]
+    numbers = {start: i for i, start in enumerate(keep, 1)}
+    images: list[PromptImage] = []
+
+    def repl(m: re.Match[str]) -> str:
+        n = numbers.get(m.start())
+        if n is None:
+            return _image_label(m.group(1))
+        media_type, data = loaded[m.start()]
+        images.append(PromptImage(label=_image_label(m.group(1), n), media_type=media_type, data_b64=data))
+        return images[-1].label
+
+    return _NOTEBOOK_IMAGE_RE.sub(repl, text), images
+
+
 def _tail_truncate(text: str, cap: int, marker: str) -> str:
     """Keep the trailing `cap` chars of `text`; prepend `marker` if anything was dropped."""
     body = text or ""
@@ -754,16 +848,20 @@ async def llm_meeting_summary(
     meeting_context: str = "",
     dictionary_terms: "object" = (),
     notebook: str = "",
+    assets_dir: Path | None = None,
 ) -> str:
     """Produce a post-meeting markdown summary with **Key takeaways** and **Next actions**.
 
     - Returns `MEETING_SUMMARY_OFFLINE_MARKDOWN` when no LLM backend is configured (so the
       app can still write a meaningful `summary.md`).
+    - Screenshots embedded in the notebook (files under `assets_dir`) are attached as images;
+      when the model rejects them, the summary is retried text-only with a short note.
     - On LLM error / empty result after retries, falls back to the offline markdown plus a short
       diagnostic line so the user knows why.
     """
     transcript = (transcript_text or "").strip()
-    notebook_text = (notebook or "").strip()
+    raw_notebook = (notebook or "").strip()
+    notebook_text = notebook_for_prompt(raw_notebook)
     if not transcript and not notebook_text:
         return (
             "## Key takeaways\n\n"
@@ -787,27 +885,43 @@ async def llm_meeting_summary(
         MEETING_SUMMARY_INSIGHTS_TRUNCATION_MARKER,
     )
     ctx = meeting_context.strip() if meeting_context else "(none)"
-    notebook_blob = (
-        _tail_truncate(notebook_text, _MEETING_SUMMARY_NOTEBOOK_CHAR_CAP, MEETING_SUMMARY_NOTEBOOK_TRUNCATION_MARKER)
-        if notebook_text
-        else "(none)"
-    )
 
-    prompt = (
-        MEETING_SUMMARY_TEMPLATE.replace(
-            "<<<MEETING_TITLE>>>", _meeting_title_for_prompt(meeting_title)
+    def build(notebook_md: str, image_count: int) -> str:
+        blob = (
+            _tail_truncate(notebook_md, _MEETING_SUMMARY_NOTEBOOK_CHAR_CAP, MEETING_SUMMARY_NOTEBOOK_TRUNCATION_MARKER)
+            if notebook_md
+            else "(none)"
         )
-        .replace("<<<MEETING_CONTEXT>>>", ctx)
-        .replace("<<<DICTIONARY>>>", _dictionary_block(dictionary_terms))
-        .replace("<<<NOTEBOOK>>>", notebook_blob)
-        .replace("<<<INSIGHTS>>>", insights_blob)
-        .replace("<<<SNIPPET>>>", transcript_blob or "(no transcript captured)")
-    )
+        images_note = (
+            f"\nThe notebook embeds {image_count} screenshot(s), attached to this message as images and referenced "
+            "above as `[image N: …]` in the same order. Treat them as part of the notebook: use the text, numbers, "
+            "charts, decisions and action items they show (e.g. slides, whiteboards, shared documents). "
+            "Do not describe the images themselves.\n\n"
+            if image_count
+            else "\n"
+        )
+        return (
+            MEETING_SUMMARY_TEMPLATE.replace("<<<MEETING_TITLE>>>", _meeting_title_for_prompt(meeting_title))
+            .replace("<<<MEETING_CONTEXT>>>", ctx)
+            .replace("<<<DICTIONARY>>>", _dictionary_block(dictionary_terms))
+            .replace("<<<NOTEBOOK>>>", blob)
+            .replace("<<<NOTEBOOK_IMAGES>>>\n", images_note)
+            .replace("<<<INSIGHTS>>>", insights_blob)
+            .replace("<<<SNIPPET>>>", transcript_blob or "(no transcript captured)")
+        )
 
-    text, err = await _llm_user_text_with_retry(prompt, 1024)
+    numbered, images = notebook_with_images(raw_notebook, assets_dir)
+    note = ""
+    if images:
+        text, err = await _llm_user_text_with_retry(build(numbered, len(images)), 1024, attempts=2, images=images)
+        if not _strip_code_fence(text).strip() and err != "empty":
+            text, err = await _llm_user_text_with_retry(build(notebook_text, 0), 1024)
+            note = "\n\n_The model could not read the notebook screenshots, so this summary uses text only._\n"
+    else:
+        text, err = await _llm_user_text_with_retry(build(notebook_text, 0), 1024)
     body = _strip_code_fence(text).strip()
     if body:
-        return body
+        return f"{body}{note}" if note else body
     diag = (
         "_LLM returned an empty summary after retries (transient)._"
         if err == "empty"

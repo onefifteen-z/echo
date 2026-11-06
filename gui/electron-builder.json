@@ -4,15 +4,17 @@
   "directories": {
     "output": "release"
   },
-  "files": ["dist/**/*", "package.json"],
+  "files": ["dist/**/*", "package.json", "assets/icons/tray/**"],
   "extraResources": [
     { "from": "../echo", "to": "python/echo", "filter": ["**/*", "!**/__pycache__/**"] },
     { "from": "../pyproject.toml", "to": "python/pyproject.toml" },
     { "from": "../README.md", "to": "python/README.md" },
-    { "from": "../AGENT.md", "to": "python/AGENT.md" }
+    { "from": "../AGENT.md", "to": "python/AGENT.md" },
+    { "from": "native/MeetingWatch.swift", "to": "native/MeetingWatch.swift" }
   ],
   "mac": {
     "target": "dmg",
+    "icon": "assets/icons/mac/icon.icns",
     "category": "public.app-category.productivity",
     "hardenedRuntime": true,
     "entitlements": "build/entitlements.mac.plist",
@@ -25,9 +27,11 @@
     }
   },
   "win": {
-    "target": "nsis"
+    "target": "nsis",
+    "icon": "assets/icons/win/icon.ico"
   },
   "linux": {
-    "target": "AppImage"
+    "target": "AppImage",
+    "icon": "assets/icons/png"
   }
 }

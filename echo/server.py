@@ -196,6 +196,7 @@ class EchoServer:
             self._unsubscribe()
             self._unsubscribe = None
         await s.stop()
+        self.broadcast({"type": "event", "event": s.status().to_dict()})
         out = s.save_outputs(announce=False)
         await s.wait_for_summary()
         return str(out)
@@ -574,6 +575,11 @@ async def _serve(args: argparse.Namespace) -> None:
     ) as ws_server:
         port = next(iter(ws_server.sockets)).getsockname()[1]
         print(json.dumps({"port": port, "token": token, "protocol": PROTOCOL_VERSION}), flush=True)
+        from echo.preflight import preflight_modules, warm_imports
+
+        threading.Thread(
+            target=warm_imports, args=(preflight_modules(live=True),), daemon=True, name="echo-warm-imports"
+        ).start()
         await stop.wait()
         await server.shutdown()
 
@@ -598,7 +604,7 @@ def main() -> None:
     real_stdout = sys.stdout
     sys.stdout = sys.stderr
     try:
-        run_preflight(live=True)
+        run_preflight(live=True, warm=False)
     finally:
         sys.stdout = real_stdout
     asyncio.run(_serve(args))

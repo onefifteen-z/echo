@@ -619,6 +619,7 @@ class EchoSession:
                 meeting_context=self.meeting_context,
                 dictionary_terms=self._dictionary_terms(),
                 notebook=self.notebook_md,
+                assets_dir=self.output_dir / "notes-assets",
             )
             summary_path.write_text(md, encoding="utf-8")
             patch_meeting_json(self.output_dir, summary_preview=summary_preview(md))

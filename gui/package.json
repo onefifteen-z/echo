@@ -19,9 +19,18 @@
     "start": "electron .",
     "test": "vitest run",
     "package": "npm run build && electron-builder --config electron-builder.json",
-    "package:mac": "npm run build && electron-builder --config electron-builder.json --mac"
+    "package:mac": "npm run build && electron-builder --config electron-builder.json --mac",
+    "icons": "node scripts/make-icons.mjs"
   },
   "dependencies": {
+    "@tiptap/extension-image": "^3.33.0",
+    "@tiptap/extension-list": "^3.33.0",
+    "@tiptap/extension-placeholder": "^3.33.0",
+    "@tiptap/extension-table": "^3.33.0",
+    "@tiptap/markdown": "^3.33.0",
+    "@tiptap/pm": "^3.33.0",
+    "@tiptap/react": "^3.33.0",
+    "@tiptap/starter-kit": "^3.33.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^9.0.1",
@@ -29,6 +38,7 @@
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
     "@tailwindcss/vite": "^4.2.2",
     "@types/node": "^22.10.5",
     "@types/react": "^18.3.12",

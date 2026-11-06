@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
-import type { Language, SessionStartArgs, SidecarState } from "@shared/types";
+import type { Language, SessionStartArgs, SidecarState, TrayCommand } from "@shared/types";
 import { ChatNotebookPanel } from "./components/Chat";
 import { Insights } from "./components/Insights";
 import { MeetingsView } from "./components/MeetingsView";
@@ -40,6 +40,8 @@ export default function App() {
   const [meetingsRefresh, setMeetingsRefresh] = useState(0);
   const [selectMeeting, setSelectMeeting] = useState<string | null>(null);
   const [settingsRev, setSettingsRev] = useState(0);
+  const [setupTitle, setSetupTitle] = useState("");
+  const [setupRev, setSetupRev] = useState(0);
   const chatSeq = useRef(0);
   const toastSeq = useRef(0);
 
@@ -128,6 +130,63 @@ export default function App() {
     return r;
   }, []);
 
+  const stopMeeting = useCallback(async () => {
+    try {
+      const r = await stopLive();
+      if (r.output_dir) {
+        const id = folderName(r.output_dir);
+        toast("Meeting saved.", "info", r.output_dir, {
+          label: "View in Meetings",
+          run: () => {
+            setSelectMeeting(id);
+            setView("meetings");
+          },
+        });
+      }
+    } catch (e) {
+      toast(errorText(e), "error");
+    }
+  }, [stopLive, toast]);
+
+  useEffect(() => {
+    const handle = (cmd: TrayCommand) => {
+      if (cmd.kind === "stop") void stopMeeting();
+      if (cmd.kind === "new") {
+        setSetupTitle(cmd.title ?? "");
+        setSetupRev((n) => n + 1);
+        setShowSetup(true);
+        setView("live");
+      }
+    };
+    const off = window.echo.onTrayCommand(handle);
+    void window.echo.takePendingCommand().then((cmd) => cmd && handle(cmd));
+    return off;
+  }, [stopMeeting]);
+
+  // A session started from the meeting prompt (main process): show it live.
+  useEffect(
+    () =>
+      window.echo.onSessionAttached(() => {
+        window.echo
+          .invoke("session.snapshot", {})
+          .then((snap) => {
+            if (!snap.status) return;
+            dispatch({ kind: "clear" });
+            dispatch({ kind: "snapshot", snapshot: snap });
+            setShowSetup(false);
+            setView("live");
+          })
+          .catch(() => undefined);
+      }),
+    [],
+  );
+
+  const liveId = state.meetingId;
+  const loadLiveContext = useCallback(
+    async () => (liveId ? (await window.echo.invoke("meetings.get", { id: liveId })).context : ""),
+    [liveId],
+  );
+
   async function run(action: () => Promise<unknown>, okText?: string) {
     try {
       await action();
@@ -196,7 +255,7 @@ export default function App() {
       ) : showSetup || !status ? (
         <div className="min-h-0 flex-1">
           {sidecar.phase === "ready" ? (
-            <SetupDialog key={settingsRev} busy={starting} appleInstall={state.appleInstall} onStart={start} />
+            <SetupDialog key={`${settingsRev}-${setupRev}`} initialTitle={setupTitle} busy={starting} appleInstall={state.appleInstall} onStart={start} />
           ) : (
             <div className="pt-24 text-center text-sm text-zinc-500">Waiting for the Echo engine…</div>
           )}
@@ -226,22 +285,21 @@ export default function App() {
                 void run(() => window.echo.reset({ resume: true }), "Session reset");
               }
             }}
-            onStop={() =>
-              void run(async () => {
-                const r = await stopLive();
-                if (r.output_dir) {
-                  const id = folderName(r.output_dir);
-                  toast("Meeting saved.", "info", r.output_dir, {
-                    label: "View in Meetings",
-                    run: () => {
-                      setSelectMeeting(id);
-                      setView("meetings");
-                    },
-                  });
-                }
-              })
-            }
+            onStop={() => void stopMeeting()}
             onNew={() => setShowSetup(true)}
+            onRename={
+              state.meetingId
+                ? (title) =>
+                    run(() => window.echo.invoke("meetings.update", { id: state.meetingId!, title }), "Meeting renamed")
+                : undefined
+            }
+            loadContext={loadLiveContext}
+            onContext={
+              state.meetingId
+                ? (context) =>
+                    run(() => window.echo.invoke("meetings.update", { id: state.meetingId!, context }), "Context updated")
+                : undefined
+            }
           />
           <main className="grid min-h-0 flex-1 grid-cols-[minmax(0,3fr)_minmax(0,2fr)] gap-3 p-3">
             <div className="flex min-h-0 flex-col gap-3">
@@ -255,8 +313,10 @@ export default function App() {
               <ChatNotebookPanel
                 notebook={{
                   docKey: state.meetingId ?? "live",
+                  meetingId: state.meetingId,
                   initial: state.notebook,
                   onSave: (text) => window.echo.invoke("session.notebook.set", { text }),
+                  onError: (message) => toast(message, "error"),
                 }}
                 items={state.chat}
                 disabled={status.llm_offline || state.stopped}
