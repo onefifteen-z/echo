@@ -61,11 +61,12 @@ class InsightPending(EngineEvent):
 class InsightPass(EngineEvent):
     n: int
     stamp: str
-    kind: Literal["comment", "web_search"]
+    kind: Literal["comment", "web_search", "wiki"]
     body_md: str
     routing_md: str | None = None
     corrected_md: str | None = None
     web_md: str | None = None
+    vault: str | None = None
     type: str = field(init=False, default="insight.pass")
 
 
@@ -89,6 +90,7 @@ class Status(EngineEvent):
     llm_offline: bool
     meeting_title: str
     elapsed: str
+    vault: str | None = None
     type: str = field(init=False, default="status")
 
 

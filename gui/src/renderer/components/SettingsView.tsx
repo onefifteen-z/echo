@@ -7,6 +7,7 @@ import type {
   ProbeResult,
   SettingsPatch,
   SettingsSnapshot,
+  WikiVaults,
 } from "@shared/types";
 import type { AppleInstallView } from "../lib/session-store";
 import {
@@ -122,6 +123,7 @@ export function SettingsView({ engineReady, liveRunning, appleInstall, endLive, 
   const [snap, setSnap] = useState<SettingsSnapshot | null>(null);
   const [effective, setEffective] = useState<Record<string, EffectiveValue>>({});
   const [probe, setProbe] = useState<ProbeResult | null>(null);
+  const [wiki, setWiki] = useState<WikiVaults | null>(null);
   const [apple, setApple] = useState<Record<string, string>>({});
   const [installing, setInstalling] = useState<Language | null>(null);
   const [edits, setEdits] = useState<Edits>({});
@@ -138,6 +140,7 @@ export function SettingsView({ engineReady, liveRunning, appleInstall, endLive, 
     const keys = [...new Set([...CURATED_KEYS, ...Object.keys(s.env), ...s.secretsSet])];
     window.echo.invoke("config.effective", { keys }).then(setEffective).catch(() => undefined);
     window.echo.invoke("probe", {}).then(setProbe).catch(() => undefined);
+    window.echo.invoke("wiki.vaults", {}).then(setWiki).catch(() => undefined);
   }, [engineReady]);
 
   useEffect(() => {
@@ -281,7 +284,7 @@ export function SettingsView({ engineReady, liveRunning, appleInstall, endLive, 
           {f.kind === "file" && (
             <Button
               onClick={async () => {
-                const p = await window.echo.chooseFile(current || undefined);
+                const p = await window.echo.chooseFile(current || undefined, f.fileKind);
                 if (p) setEdit(f.key, p);
               }}
             >
@@ -420,6 +423,16 @@ export function SettingsView({ engineReady, liveRunning, appleInstall, endLive, 
                     Engine currently uses: <span className="text-zinc-300">{probe.search.provider}</span>
                     {probe.search.note && <span className="text-amber-300"> — {probe.search.note}</span>}
                   </p>
+                )}
+                {g.id === "knowledge" && wiki && (
+                  <div className="flex flex-wrap items-center gap-2 pt-2.5 text-xs text-zinc-500">
+                    <Chip tone={wiki.available && wiki.vaults.length > 0 ? "ok" : "warn"}>
+                      {wiki.available ? `${wiki.vaults.length} vault${wiki.vaults.length === 1 ? "" : "s"}` : "Not found"}
+                    </Chip>
+                    <span className="selectable">
+                      {wiki.reason ?? wiki.vaults.map((v) => v.name).join(", ")}
+                    </span>
+                  </div>
                 )}
                 {g.id === "llm" && probe && (
                   <p className="pt-2.5 text-xs text-zinc-500">

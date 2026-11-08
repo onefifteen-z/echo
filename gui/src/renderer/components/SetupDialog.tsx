@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import type { AsrBackendChoice, AudioSource, InputDevice, Language, ProbeResult, SessionStartArgs } from "@shared/types";
+import type { AsrBackendChoice, AudioSource, InputDevice, Language, ProbeResult, SessionStartArgs, WikiVaults } from "@shared/types";
 import type { AppleInstallView } from "../lib/session-store";
 import { appleLocaleState, Button, LANGUAGE_LABELS } from "./ui";
 
@@ -23,14 +23,24 @@ export function SetupDialog({ busy, initialTitle = "", appleInstall, onStart }: 
   const [error, setError] = useState<string | null>(null);
   const [installing, setInstalling] = useState(false);
   const [workspace, setWorkspace] = useState("Documents/Echo");
+  const [vaults, setVaults] = useState<WikiVaults | null>(null);
+  const [vault, setVault] = useState<string>("");
 
   useEffect(() => {
     window.echo.invoke("probe", {}).then(setProbe).catch(() => undefined);
+    const vaultList = window.echo.invoke("wiki.vaults", {}).catch(
+      (e): WikiVaults => ({ available: false, reason: e instanceof Error ? e.message : String(e), vaults: [] }),
+    );
+    void vaultList.then(setVaults);
     window.echo
       .getSettings()
       .then(async (s) => {
         setWorkspace(s.workspaceDir.replace(/^\/Users\/[^/]+/, "~"));
         const last = s.prefs.lastStart;
+        if (last?.vault) {
+          const v = await vaultList;
+          if (v.vaults.some((x) => x.name === last.vault)) setVault(last.vault);
+        }
         if (last) {
           setSource(last.source);
           setBackend(last.backend);
@@ -76,7 +86,7 @@ export function SetupDialog({ busy, initialTitle = "", appleInstall, onStart }: 
   async function submit() {
     setError(null);
     try {
-      await onStart({ title, context, source, backend, language, mic_device: micDevice });
+      await onStart({ title, context, source, backend, language, mic_device: micDevice, vault: vault || null });
     } catch (e) {
       setError((e instanceof Error ? e.message : String(e)).replace(/^Error invoking remote method '[^']+': (Error: )?/, ""));
     }
@@ -147,6 +157,31 @@ export function SetupDialog({ busy, initialTitle = "", appleInstall, onStart }: 
               </select>
             </div>
           )}
+
+          <div>
+            <label className={label}>Knowledge vault (optional)</label>
+            <select
+              className={field}
+              value={vault}
+              disabled={!vaults?.available || vaults.vaults.length === 0}
+              onChange={(e) => setVault(e.target.value)}
+            >
+              <option value="">None</option>
+              {vaults?.vaults.map((v) => (
+                <option key={v.path} value={v.name}>
+                  {v.name}
+                  {v.initialized ? "" : " (no wiki yet)"}
+                </option>
+              ))}
+            </select>
+            <p className="mt-1 text-xs text-zinc-500">
+              {vaults === null
+                ? "Looking for Lumina vaults…"
+                : vaults.reason && vaults.vaults.length === 0
+                  ? vaults.reason
+                  : "Insights and chat consult this Lumina wiki when the conversation touches what it covers. You can change it during the meeting."}
+            </p>
+          </div>
 
           {showAppleInstall && (
             <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-200">

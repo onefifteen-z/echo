@@ -1,11 +1,14 @@
 /** Curated settings shown as forms; anything else lives in the Advanced key/value editor. */
 
+import type { FileKind } from "@shared/types";
+
 export type FieldKind = "text" | "secret" | "number" | "select" | "bool" | "file";
 
 export interface FieldDef {
   key: string;
   label: string;
   kind: FieldKind;
+  fileKind?: FileKind;
   help?: string;
   /** Shown as placeholder: the engine's built-in default. */
   placeholder?: string;
@@ -130,6 +133,21 @@ export const SETTINGS_GROUPS: GroupDef[] = [
         kind: "text",
         placeholder: "auto",
         help: "auto, bing, duckduckgo, yahoo, …",
+      },
+    ],
+  },
+  {
+    id: "knowledge",
+    title: "Knowledge vault (Lumina)",
+    description:
+      "Pick a Lumina vault when starting a meeting (or from the top bar) and insights and chat consult its wiki on demand. Echo starts Lumina's read-only MCP server itself; Lumina does not need to be open.",
+    fields: [
+      {
+        key: "ECHO_LUMINA_APP",
+        label: "Lumina app",
+        kind: "file",
+        fileKind: "app",
+        placeholder: "/Applications/Lumina.app",
       },
     ],
   },

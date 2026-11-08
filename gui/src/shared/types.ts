@@ -19,6 +19,8 @@ export interface Status {
   llm_offline: boolean;
   meeting_title: string;
   elapsed: string;
+  /** Lumina knowledge vault attached to the session, if any. */
+  vault?: string | null;
 }
 
 export interface TranscriptLineState {
@@ -32,11 +34,13 @@ export interface InsightPassEvent {
   type: "insight.pass";
   n: number;
   stamp: string;
-  kind: "comment" | "web_search";
+  kind: "comment" | "web_search" | "wiki";
   body_md: string;
   routing_md: string | null;
   corrected_md: string | null;
+  /** Web search results, or the matched vault pages for `kind === "wiki"`. */
   web_md: string | null;
+  vault?: string | null;
 }
 
 export type EchoEvent =
@@ -64,6 +68,23 @@ export interface SessionStartArgs {
   backend: AsrBackendChoice;
   language: Language;
   mic_device?: number | null;
+  /** Lumina vault name; omitted or null for none. */
+  vault?: string | null;
+}
+
+export interface WikiVault {
+  name: string;
+  path: string;
+  /** Lumina's most recently opened vault. */
+  default: boolean;
+  /** Has a `wiki/` folder (a vault that was never compiled has none). */
+  initialized: boolean;
+}
+
+export interface WikiVaults {
+  available: boolean;
+  reason?: string;
+  vaults: WikiVault[];
 }
 
 export interface SessionSnapshot {
@@ -110,7 +131,7 @@ export interface MeetingUpdate {
 }
 
 /** Capture settings reused by "Start transcribing" in the meeting prompt. */
-export type LastStart = Pick<SessionStartArgs, "source" | "backend" | "language" | "mic_device">;
+export type LastStart = Pick<SessionStartArgs, "source" | "backend" | "language" | "mic_device" | "vault">;
 
 export interface AppPrefs {
   meetingDetection: boolean;
@@ -187,6 +208,8 @@ export interface CommandMap {
   "meetings.update": [MeetingUpdate, MeetingDetail];
   "meetings.regenerate_summary": [{ id: string }, { id: string; summary_md: string }];
   "config.effective": [{ keys: string[] }, Record<string, EffectiveValue>];
+  "wiki.vaults": [Record<string, never>, WikiVaults];
+  "session.set_vault": [{ vault: string | null }, Status];
 }
 
 export type CommandName = keyof CommandMap;
@@ -213,6 +236,9 @@ export const IPC = {
 } as const;
 
 export type MeetingApp = "zoom" | "teams";
+
+/** What `chooseFile` lets the user pick. */
+export type FileKind = "yaml" | "app";
 
 export interface MeetingWatchStatus {
   state: "stopped" | "starting" | "running" | "unavailable";
@@ -272,7 +298,7 @@ export interface EchoAPI {
   /** Persist settings; with `restart`, the engine restarts so the new environment takes effect. */
   saveSettings(patch: SettingsPatch, opts: { restart: boolean }): Promise<SettingsSnapshot>;
   chooseDir(current?: string): Promise<string | null>;
-  chooseFile(current?: string): Promise<string | null>;
+  chooseFile(current?: string, kind?: FileKind): Promise<string | null>;
   onTrayCommand(cb: (cmd: TrayCommand) => void): () => void;
   /** Command queued while the window was (re)loading, if any. */
   takePendingCommand(): Promise<TrayCommand | null>;

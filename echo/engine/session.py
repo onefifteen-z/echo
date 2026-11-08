@@ -43,6 +43,7 @@ from echo.engine.text import (
     InsightPassRecord,
     TranscriptSegment,
     _format_web_search_md,
+    _format_wiki_md,
     _has_meaningful_new_content_since_comment,
     _insight_corrected_segment_md,
     _insight_routing_collapsible,
@@ -67,8 +68,11 @@ from echo.llm import (
     llm_meeting_summary,
     llm_route_insight,
     llm_synthesize_web_findings,
+    llm_synthesize_wiki_findings,
+    wiki_sources_block,
 )
 from echo.search import SearchHit, web_search
+from echo.wiki import LuminaWiki, WikiError, WikiHit, WikiPage
 from echo.text_utils import format_timestamp_hms
 
 logger = logging.getLogger("echo.engine")
@@ -108,6 +112,8 @@ class EchoSession:
         meeting_context: str = "",
         output_dir: Path | None = None,
         language: str | None = None,
+        vault: str | None = None,
+        wiki: LuminaWiki | None = None,
     ) -> None:
         self.replay_path = replay_path
         self.replay_lines = list(replay_lines)
@@ -157,6 +163,10 @@ class EchoSession:
         ).strip().lower() or "japanese"
         self.live_asr_language = env_lang if env_lang in self.live_asr_languages else "japanese"
         self._llm_offline = llm_offline
+        self._wiki = wiki
+        self.vault: str | None = (vault or "").strip() or None
+        self._vault_titles: dict[str, list[str]] = {}
+        self._vault_warm_task: asyncio.Task[None] | None = None
         self._summary_task: asyncio.Task[None] | None = None
         self._live_wall_t0: float | None = None
         self._live_reset_seq = 0
@@ -341,6 +351,7 @@ class EchoSession:
             llm_offline=self._llm_offline,
             meeting_title=self.meeting_title,
             elapsed=self._elapsed_hms(),
+            vault=self.vault,
         )
 
     def short_asr_label(self) -> str:
@@ -408,6 +419,39 @@ class EchoSession:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._tick_header()
 
+    @property
+    def wiki(self) -> LuminaWiki:
+        if self._wiki is None:
+            self._wiki = LuminaWiki()
+        return self._wiki
+
+    def set_vault(self, vault: str | None) -> None:
+        """Attach (or clear with ``None``) the Lumina knowledge vault used by insights and chat."""
+        self.vault = (vault or "").strip() or None
+        self._debug_note(f"knowledge vault -> {self.vault or '-'}")
+        self._warm_vault()
+        self._tick_header()
+
+    def _warm_vault(self) -> None:
+        """Start the vault's MCP process and cache page titles in the background (first start can be slow)."""
+        vault = self.vault
+        if not vault or vault in self._vault_titles:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _run() -> None:
+            try:
+                self._vault_titles[vault] = await self.wiki.titles(vault)
+            except WikiError as e:
+                self._debug_note(f"knowledge vault warm-up failed: {e}")
+            except Exception:  # noqa: BLE001
+                logger.exception("knowledge vault warm-up failed")
+
+        self._vault_warm_task = loop.create_task(_run())
+
     def _dictionary_terms(self) -> tuple[str, ...]:
         from echo.dictionary import load_dictionary
 
@@ -428,6 +472,7 @@ class EchoSession:
         ]
         if self.live_audio:
             self._tasks.append(loop.create_task(self._meter_ticker()))
+        self._warm_vault()
         self._tick_header()
 
     async def stop(self) -> None:
@@ -566,7 +611,10 @@ class EchoSession:
         (self.output_dir / "notebook.md").write_text(self.notebook_md, encoding="utf-8")
         (self.output_dir / "insights.json").write_text(
             json.dumps(
-                [{"n": r.n, "stamp": r.stamp, "kind": r.kind, "body_md": r.body_md} for r in self._insight_passes],
+                [
+                    {"n": r.n, "stamp": r.stamp, "kind": r.kind, "body_md": r.body_md, **({"vault": r.vault} if r.vault else {})}
+                    for r in self._insight_passes
+                ],
                 ensure_ascii=False,
                 indent=1,
             ),
@@ -650,6 +698,7 @@ class EchoSession:
             "asr_source": self.asr_load_source or "",
             "line_count": len(self._lines),
             "has_notebook": bool(self.notebook_md.strip()),
+            "vault": self.vault,
         }
 
     def _meeting_context_markdown(self) -> str:
@@ -663,7 +712,7 @@ class EchoSession:
             lines.append("")
             return "\n".join(lines)
         for rec in self._insight_passes:
-            heading = "Comment" if rec.kind == "comment" else "Research summary"
+            heading = {"comment": "Comment", "wiki": f"From {rec.vault or 'knowledge vault'}"}.get(rec.kind, "Research summary")
             lines.append(f"## Pass {rec.n} @ {rec.stamp}")
             lines.append("")
             lines.append(f"### {heading}")
@@ -671,7 +720,7 @@ class EchoSession:
             lines.append(rec.body_md.strip() or "_(empty)_")
             lines.append("")
             if rec.web_md:
-                lines.append("### Web search")
+                lines.append("### Vault pages" if rec.kind == "wiki" else "### Web search")
                 lines.append("")
                 lines.append(rec.web_md.strip())
                 lines.append("")
@@ -1061,6 +1110,7 @@ class EchoSession:
                 routing_md=rec.routing_md,
                 corrected_md=rec.corrected_md,
                 web_md=rec.web_md,
+                vault=rec.vault,
             )
         )
 
@@ -1097,6 +1147,8 @@ class EchoSession:
                             f"insight pass input segments={len(seg_payload)} "
                             f"ids={seg_payload[0][0]}-{seg_payload[-1][0]}",
                         )
+                    vault = self.vault
+                    vault_hits = await self._vault_hints(vault, snapshot) if vault else []
                     route = await asyncio.wait_for(
                         llm_route_insight(
                             snapshot,
@@ -1104,6 +1156,9 @@ class EchoSession:
                             meeting_context=self.meeting_context,
                             meeting_title=self.meeting_title,
                             dictionary_terms=self._dictionary_terms(),
+                            vault=vault,
+                            vault_titles=self._vault_titles.get(vault or "", []),
+                            vault_hits=vault_hits,
                         ),
                         timeout=llm_timeout,
                     )
@@ -1161,6 +1216,9 @@ class EchoSession:
                         ),
                     )
                     self._last_comment_input_snapshot = _normalize_spaces(snapshot)
+                elif route.action == "wiki_lookup" and self.vault:
+                    if not await self._run_wiki_pass(route, ctx, corrected_md, next_n, stamp, llm_timeout, _is_stale):
+                        return
                 else:
                     query = route.search_query.strip() or ctx[:100].strip()
                     hits: list[SearchHit] = []
@@ -1232,6 +1290,98 @@ class EchoSession:
                     ),
                 )
 
+    async def _run_wiki_pass(
+        self,
+        route: InsightRouteResult,
+        ctx: str,
+        corrected_md: str | None,
+        n: int,
+        stamp: str,
+        llm_timeout: float,
+        is_stale: Callable[[], bool],
+    ) -> bool:
+        """Search the vault and append a ``wiki`` insight. Returns False when the pass went stale."""
+        vault = self.vault or ""
+        query = route.wiki_query.strip() or route.search_query.strip() or ctx[:100].strip()
+        hits: list[WikiHit] = []
+        pages: list[WikiPage] = []
+        err = ""
+        try:
+            hits, pages = await asyncio.wait_for(self.wiki.lookup(vault, query, limit=5, read=3), timeout=30)
+        except asyncio.TimeoutError:
+            err = f"Lumina is still loading **{vault}** (the first start can take up to a minute); the next pass will retry."
+        except WikiError as e:
+            err = f"Knowledge vault lookup failed: {e}"
+        except Exception as e:  # noqa: BLE001 — Lumina must never break an insight pass
+            err = f"Knowledge vault lookup failed: `{e!s}`"
+        self._debug_note(f"wiki lookup vault={vault} hits={len(hits)} pages={len(pages)} err={err or '-'}")
+        if err or not hits:
+            body = f"_{err}_" if err else f"_Nothing in **{vault}** matched `{query}`._"
+            if route.comment.strip():
+                body = f"{route.comment.strip()}\n\n{body}"
+        else:
+            try:
+                body = await asyncio.wait_for(
+                    llm_synthesize_wiki_findings(
+                        ctx,
+                        query,
+                        hits,
+                        pages,
+                        vault=vault,
+                        meeting_context=self.meeting_context,
+                        meeting_title=self.meeting_title,
+                        dictionary_terms=self._dictionary_terms(),
+                    ),
+                    timeout=llm_timeout,
+                )
+            except asyncio.TimeoutError:
+                body = f"_Vault synthesis LLM timed out after {llm_timeout:.0f}s; showing vault matches._"
+            except Exception as e:  # noqa: BLE001
+                body = f"_Vault synthesis failed:_ `{e!s}`"
+        if is_stale():
+            self._debug_note("insight pass aborted reason=session_reset post-wiki")
+            return False
+        await self._append_insight_pass(
+            InsightPassRecord(
+                n=n,
+                stamp=stamp,
+                kind="wiki",
+                body_md=body.strip() or "_(empty)_",
+                routing_md=_insight_routing_collapsible(route, web_path=False, wiki_path=True),
+                corrected_md=corrected_md,
+                web_md=_format_wiki_md(query, hits, err, vault=vault),
+                vault=vault,
+            ),
+        )
+        return True
+
+    async def _vault_hints(self, vault: str, snapshot: str) -> list[WikiHit]:
+        """Quick keyword search on the chunk so the router can judge whether the vault is relevant."""
+        self._warm_vault()
+        if vault not in self._vault_titles:
+            return []
+        try:
+            return await asyncio.wait_for(self.wiki.search(vault, snapshot[-600:], limit=6), timeout=4)
+        except Exception as e:  # noqa: BLE001 — hints are optional
+            self._debug_note(f"vault hint search skipped: {e or 'timeout'}")
+            return []
+
+    async def _chat_wiki_excerpts(self, question: str) -> str:
+        vault = self.vault
+        if not vault:
+            return ""
+        try:
+            hits, pages = await asyncio.wait_for(self.wiki.lookup(vault, question, limit=5, read=2), timeout=20)
+        except (WikiError, asyncio.TimeoutError) as e:
+            self._debug_note(f"chat wiki lookup skipped: {e or 'timeout'}")
+            return ""
+        except Exception:  # noqa: BLE001
+            logger.exception("chat wiki lookup failed")
+            return ""
+        if not hits:
+            return ""
+        return f"Knowledge vault \"{vault}\" (search results for the question):\n<<<\n{wiki_sources_block(hits, pages)}\n>>>"
+
     # ------------------------------------------------------------------ chat
 
     def _chat_transcript_context(self) -> str:
@@ -1260,6 +1410,7 @@ class EchoSession:
                     self.meeting_context,
                     meeting_title=self.meeting_title,
                     dictionary_terms=self._dictionary_terms(),
+                    wiki_excerpts=await self._chat_wiki_excerpts(q),
                 )
             except Exception as e:  # noqa: BLE001 — surface errors in the chat pane
                 ans = f"(error) {e!s}"

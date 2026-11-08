@@ -7,6 +7,7 @@ import {
   IPC,
   type AppPrefs,
   type CommandName,
+  type FileKind,
   type MeetingPromptData,
   type SessionStartArgs,
   type SettingsPatch,
@@ -71,6 +72,8 @@ const ALLOWED_COMMANDS: ReadonlySet<CommandName> = new Set<CommandName>([
   "meetings.update",
   "meetings.regenerate_summary",
   "config.effective",
+  "wiki.vaults",
+  "session.set_vault",
 ]);
 
 function logLine(line: string): void {
@@ -181,7 +184,13 @@ const DEFAULT_START: NonNullable<AppPrefs["lastStart"]> = { source: "both", back
 async function startFromPrompt(service: SidecarService, data: MeetingPromptData): Promise<void> {
   const last = settings!.prefs().lastStart ?? DEFAULT_START;
   try {
-    await service.invoke("session.start", { ...last, title: data.title, context: "" });
+    try {
+      await service.invoke("session.start", { ...last, title: data.title, context: "" });
+    } catch (err) {
+      if (!last.vault) throw err;
+      logLine(`meeting prompt: start with vault ${last.vault} failed (${String(err)}); retrying without a vault`);
+      await service.invoke("session.start", { ...last, vault: null, title: data.title, context: "" });
+    }
     logLine(`meeting prompt: started transcription for ${data.appName}`);
     showWindow({ inactive: true });
     broadcast(IPC.sessionAttached, null);
@@ -298,8 +307,12 @@ function registerIpc(service: SidecarService): void {
     const result = await service.invoke(cmd, (args ?? {}) as never);
     if (cmd === "session.start") {
       const a = args as SessionStartArgs;
+      const vault = a.vault ?? null;
       if (a.source !== "demo") {
-        settings!.setPrefs({ lastStart: { source: a.source, backend: a.backend, language: a.language, mic_device: a.mic_device ?? null } });
+        settings!.setPrefs({ lastStart: { source: a.source, backend: a.backend, language: a.language, mic_device: a.mic_device ?? null, vault } });
+      } else {
+        const prev = settings!.prefs().lastStart;
+        if (prev) settings!.setPrefs({ lastStart: { ...prev, vault } });
       }
     }
     return result;
@@ -358,12 +371,13 @@ function registerIpc(service: SidecarService): void {
     });
     return r.canceled || !r.filePaths[0] ? null : r.filePaths[0];
   });
-  ipcMain.handle(IPC.chooseFile, async (_e, current?: string) => {
+  ipcMain.handle(IPC.chooseFile, async (_e, current?: string, kind?: FileKind) => {
+    const isApp = kind === "app";
     const r = await dialog.showOpenDialog(mainWindow!, {
-      title: "Choose glossary file",
-      defaultPath: current || os.homedir(),
+      title: isApp ? "Choose application" : "Choose glossary file",
+      defaultPath: current || (isApp ? "/Applications" : os.homedir()),
       properties: ["openFile"],
-      filters: [{ name: "YAML", extensions: ["yml", "yaml"] }],
+      filters: isApp ? [{ name: "Applications", extensions: ["app"] }] : [{ name: "YAML", extensions: ["yml", "yaml"] }],
     });
     return r.canceled || !r.filePaths[0] ? null : r.filePaths[0];
   });

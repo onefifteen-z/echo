@@ -69,7 +69,7 @@ const api: EchoAPI = {
   getSettings: () => ipcRenderer.invoke(IPC.getSettings),
   saveSettings: (patch, opts) => ipcRenderer.invoke(IPC.saveSettings, patch, opts),
   chooseDir: (current) => ipcRenderer.invoke(IPC.chooseDir, current),
-  chooseFile: (current) => ipcRenderer.invoke(IPC.chooseFile, current),
+  chooseFile: (current, kind) => ipcRenderer.invoke(IPC.chooseFile, current, kind),
 };
 
 contextBridge.exposeInMainWorld("echo", api);

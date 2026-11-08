@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, urlparse
 
 from echo.engine.events import EngineEvent
 from echo.engine.session import LIVE_ASR_LANGUAGES, EchoSession
+from echo.wiki import LuminaWiki, WikiError, resolve_vault
 
 PROTOCOL_VERSION = 1
 
@@ -94,6 +95,7 @@ class EchoServer:
         self._unsubscribe: Callable[[], None] | None = None
         self._clients: dict[Any, asyncio.Queue[str]] = {}
         self._starting = asyncio.Lock()
+        self.wiki = LuminaWiki()
         self._handlers: dict[str, Callable[[dict[str, Any]], Awaitable[Any]]] = {
             "ping": self._cmd_ping,
             "probe": self._cmd_probe,
@@ -115,6 +117,8 @@ class EchoServer:
             "meetings.update": self._cmd_meetings_update,
             "meetings.regenerate_summary": self._cmd_meetings_regenerate_summary,
             "config.effective": self._cmd_config_effective,
+            "wiki.vaults": self._cmd_wiki_vaults,
+            "session.set_vault": self._cmd_session_set_vault,
         }
 
     # ------------------------------------------------------------------ transport
@@ -303,6 +307,7 @@ class EchoServer:
                 raise CommandError(f"Unsupported language: {language!r}")
             title = str(args.get("title") or "").strip()
             context = str(args.get("context") or "").strip()
+            vault = self._vault_arg(args.get("vault"))
             llm_ok = await asyncio.to_thread(echo_llm_online)
             output_dir = None
             if self.output_root is not None:
@@ -326,6 +331,8 @@ class EchoServer:
                     meeting_context=context,
                     output_dir=output_dir,
                     language=language,
+                    vault=vault,
+                    wiki=self.wiki,
                 )
             else:
                 system = source in ("both", "system")
@@ -356,6 +363,8 @@ class EchoServer:
                     meeting_context=context,
                     output_dir=output_dir,
                     language=language,
+                    vault=vault,
+                    wiki=self.wiki,
                 )
             session.set_meeting_metadata(session.meeting_title, session.meeting_context)
             self.session = session
@@ -391,6 +400,24 @@ class EchoServer:
         if not ok:
             raise CommandError(message)
         return {"message": message, "status": s.status().to_dict()}
+
+    @staticmethod
+    def _vault_arg(raw: object) -> str | None:
+        name = str(raw or "").strip()
+        if not name:
+            return None
+        try:
+            return str(resolve_vault(name)["name"])
+        except WikiError as e:
+            raise CommandError(str(e)) from e
+
+    async def _cmd_wiki_vaults(self, _args: dict[str, Any]) -> dict[str, Any]:
+        return await asyncio.to_thread(self.wiki.vaults)
+
+    async def _cmd_session_set_vault(self, args: dict[str, Any]) -> dict[str, Any]:
+        s = self._require_session()
+        s.set_vault(self._vault_arg(args.get("vault")))
+        return s.status().to_dict()
 
     async def _cmd_session_save(self, _args: dict[str, Any]) -> dict[str, Any]:
         s = self._require_session()
@@ -530,6 +557,7 @@ class EchoServer:
 
     async def shutdown(self) -> None:
         await self._close_session()
+        await self.wiki.close()
 
 
 def _watch_stdin_eof(loop: asyncio.AbstractEventLoop, stop: asyncio.Event) -> None:

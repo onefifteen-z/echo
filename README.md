@@ -150,6 +150,9 @@ Default is **`auto`**: **Apple (on-device)** for the **current live language** �
 | `ECHO_PERPLEXITY_MODEL` | Sonar model (default `sonar`). Alias: `AI_GATEWAY_PERPLEXITY_MODEL`. |
 | `ECHO_PERPLEXITY_TIMEOUT` | Seconds per Perplexity request (default `30`; one retry). Keep `ECHO_INSIGHT_DDG_TIMEOUT` larger, since it bounds Perplexity + ddgs fallback together. |
 | `ECHO_DDGS_BACKEND` | Metasearch backend for the `ddgs` library: `auto` (default), `bing`, `duckduckgo`, `yahoo`, … (see [ddgs docs](https://pypi.org/project/ddgs/)). If unset and `auto` returns nothing, Echo tries `bing`, then `duckduckgo`, then `yahoo`. |
+| `ECHO_LUMINA_APP` | Path to `Lumina.app` used for [knowledge vaults](#knowledge-vault-lumina) (default `/Applications/Lumina.app`). |
+| `ECHO_LUMINA_MCP_CMD` | Full Lumina MCP CLI command (shell-style), e.g. a dev build; `--vault <path>` is appended. Overrides `ECHO_LUMINA_APP`. |
+| `ECHO_LUMINA_USER_DATA` | Lumina's userData folder, where the vault list is read (default `~/Library/Application Support/Lumina`). |
 | `ECHO_NO_SPLASH` | Set to `1` / `true` / `yes` to skip the green ASCII **ECHO** startup splash (e.g. for automation). |
 | `ECHO_WHISPER_LANGUAGE` | Whisper `language=` for forced decoder ids (default `japanese` for Kotoba). Set e.g. `english` or `chinese` for other models. |
 | `ECHO_LIVE_EMIT_INTERVAL` | Legacy batch mode knob for live transcript flushing. `0` (default) keeps Echo in append-draft mode and uses semantic/pause/length segmentation rules. Positive values switch to interval batching. |
@@ -189,6 +192,17 @@ If no LLM configuration is detected, Echo still runs: keywords use a small heuri
 ### Web search
 
 Insight passes routed to **web search** use **Perplexity Sonar** when `ECHO_PERPLEXITY_BASE_URL` (or `AI_GATEWAY_PERPLEXITY_BASE_URL`) and a key are set; only **cited URLs** become results. If Perplexity is not configured, errors (auth, quota, rate limit, timeout) or returns no citations, Echo falls back to the keyless **ddgs** metasearch (`auto` → `bing` → `duckduckgo` → `yahoo`, or just `ECHO_DDGS_BACKEND`). The Insights web section shows which provider answered and any fallback reason; `echo-probe` reports the active provider.
+
+### Knowledge vault (Lumina)
+
+A meeting can optionally use one of your [Lumina](../prj-lumina) vaults (an LLM-maintained personal wiki) as extra context. Pick it in the setup dialog under *Knowledge vault (optional)*, or switch or clear it during the meeting from the vault pill in the top bar.
+
+- **Insights:** when a vault is attached, the insight router gets a third action, `wiki_lookup`, next to `comment` and `web_search`. It sees the vault name and some page titles, and picks `wiki_lookup` when the conversation touches topics, people, projects, clients or past decisions the wiki likely covers. Echo then searches the vault, reads the top pages and writes a short *From <vault>* insight that cites the `wiki/...` pages; the matched pages are listed under *Vault pages*.
+- **Chat:** every question is also searched in the vault; matching pages are added to the prompt, and the answer uses them only when relevant (with the filename cited).
+- **Failures never block the meeting:** if Lumina is slow, missing or errors, the insight says so in one line and the next pass carries on; chat simply answers without the vault.
+- **How it connects:** Echo starts Lumina's bundled MCP server over stdio (`ELECTRON_RUN_AS_NODE=1 Lumina.app/Contents/MacOS/Lumina …/app.asar/dist/main/mcp/cli.js --vault <path>`), one process per vault in use. Lumina doesn't need to be running. Echo only calls read tools (`search_wiki`, `get_article`, `list_articles`). The vault list is Lumina's own vault history (`~/Library/Application Support/Lumina/llm-wiki-config.json`). The first start of a vault can take up to a minute (index load, OneDrive); Echo warms it up in the background when the vault is selected.
+- **Overrides:** `ECHO_LUMINA_APP` (path to `Lumina.app`; also under **Settings → Knowledge vault**), `ECHO_LUMINA_MCP_CMD` (full CLI command, e.g. a dev build; `--vault` is appended), `ECHO_LUMINA_USER_DATA` (Lumina's userData folder).
+- The chosen vault is stored as `vault` in `meeting.json`, and remembered for the next meeting (including meetings started from the Zoom/Teams prompt).
 
 ### Offline / LLM reachability
 
@@ -410,9 +424,10 @@ An Electron + React + Tailwind front end (same stack as Lumina) that drives the 
   - Turn detection on or off, and re-enable muted apps, under **Settings → Meeting detection**.
   - Requirements: the Xcode Command Line Tools (`xcode-select --install`). Echo compiles a small watcher helper the first time. Meeting titles need the **Screen Recording** permission; without it, the fallback title is used. Browser meetings (Zoom or Teams on the web) are not detected.
   - Development: `ECHO_DEV_FAKE_ZOOM_BUNDLE=org.python.python npm run dev` treats any Python process using the mic as Zoom, so `python -c "import sounddevice"`-style captures can trigger the card.
+- **Knowledge vault:** optionally attach a Lumina vault in the setup dialog or from the top bar; insights and chat then consult its wiki on demand (see [Knowledge vault (Lumina)](#knowledge-vault-lumina)).
 - **Editing a live meeting:** click the title in the top bar to rename it, and use *Context…* to edit the meeting context; changes are saved to the running session and its `meeting.json`.
 - **Settings view** (bottom of the left rail): edits the engine configuration for the desktop app.
-  - **Groups:** Workspace (meetings folder, glossary file), Language model, Speech recognition (default engine, Whisper API, local device, Apple on-device model status with *Download*), Web search, Insights & transcript, Network & debugging.
+  - **Groups:** Workspace (meetings folder, glossary file), Language model, Speech recognition (default engine, Whisper API, local device, Apple on-device model status with *Download*), Web search, Knowledge vault (Lumina app path and the vaults Echo can see), Insights & transcript, Network & debugging.
   - **Advanced:** any other variable from the table above.
   - **Source badges:** each field shows where its current value comes from, *Echo settings* or *.env* (shell environment / `.env`). An empty field uses the built-in default, shown as the placeholder.
   - **Storage:** settings are stored in `~/Library/Application Support/Echo/settings.json`. Values whose name contains `KEY`, `TOKEN`, `SECRET` or `PASSWORD` are encrypted with the macOS Keychain (Electron `safeStorage`) and never sent back to the window.
@@ -442,7 +457,7 @@ npm run icons
 `echo-server [--host 127.0.0.1] [--port 0] [--output-root DIR]` prints one JSON line `{"port", "token", "protocol"}` to stdout, then serves `ws://127.0.0.1:<port>/?token=<token>`. It exits on SIGTERM or when stdin closes. Messages are JSON:
 
 - Request `{"id", "cmd", "args"}` → response `{"id", "ok", "result" | "error"}`.
-- Commands: `ping`, `probe`, `devices.list`, `apple.status`, `apple.install_assets`, `session.start` (`title`, `context`, `source`: `mic`/`both`/`system`/`demo`, `backend`, `language`, `mic_device`, `chunk_seconds`, `line_delay`), `session.stop`, `session.pause`, `session.resume`, `session.reset`, `session.set_language`, `session.save`, `session.snapshot`, `session.notebook.set` (`text`), `chat.ask`, `meetings.list`, `meetings.get` (`id`), `meetings.update` (`id`, optional `title` / `context` / `notebook`), `meetings.regenerate_summary` (`id`; emits `summary.written` with `id`), `config.effective` (`keys`; returns `{value, source: app|env|default, secret}` per key, with secret values masked). `probe` also reports the active web search provider. Deleting is done by the Electron main process (`shell.trashItem`), not the sidecar.
+- Commands: `ping`, `probe`, `devices.list`, `apple.status`, `apple.install_assets`, `session.start` (`title`, `context`, `source`: `mic`/`both`/`system`/`demo`, `backend`, `language`, `mic_device`, `chunk_seconds`, `line_delay`, optional `vault`), `session.stop`, `session.pause`, `session.resume`, `session.reset`, `session.set_language`, `session.save`, `session.snapshot`, `session.notebook.set` (`text`), `chat.ask`, `meetings.list`, `meetings.get` (`id`), `meetings.update` (`id`, optional `title` / `context` / `notebook`), `meetings.regenerate_summary` (`id`; emits `summary.written` with `id`), `config.effective` (`keys`; returns `{value, source: app|env|default, secret}` per key, with secret values masked), `wiki.vaults` (returns `{available, reason?, vaults: [{name, path, default, initialized}]}`), `session.set_vault` (`vault`: name or `null`). `probe` also reports the active web search provider. Deleting is done by the Electron main process (`shell.trashItem`), not the sidecar.
 - Server-pushed events `{"event": {...}}` mirror `echo/engine/events.py` (`transcript.draft`, `transcript.final`, `transcript.corrected`, `insight.pending`, `insight.pass`, `meter`, `status`, `notice`, `chat.reply`, `summary.written`, `session.ended`, …).
 
 ## Project layout
@@ -466,6 +481,7 @@ echo/
   audio_filters.py  # Optional VAD (Silero/WebRTC) + denoise (noisereduce)
   llm.py        # Optional Anthropic / OpenAI + fallbacks
   search.py     # DuckDuckGo (threaded)
+  wiki.py       # Read-only Lumina vault client (MCP over stdio)
   dictionary.py # Optional glossary loader (dictionary.yml -> LLM prompts)
 samples/
   sample_transcript.txt

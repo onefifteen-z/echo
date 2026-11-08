@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { Language, Status } from "@shared/types";
+import type { Language, Status, WikiVaults } from "@shared/types";
 import { Button, Chip, LANGUAGE_LABELS } from "./ui";
 
 interface Props {
@@ -16,6 +16,45 @@ interface Props {
   onRename?: (title: string) => Promise<void>;
   loadContext?: () => Promise<string>;
   onContext?: (context: string) => Promise<void>;
+  onVault?: (vault: string | null) => Promise<void>;
+}
+
+function VaultSelect({ vault, disabled, onVault }: { vault: string | null; disabled: boolean; onVault?: (vault: string | null) => Promise<void> }) {
+  const [list, setList] = useState<WikiVaults | null>(null);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    window.echo
+      .invoke("wiki.vaults", {})
+      .then(setList)
+      .catch(() => setList({ available: false, vaults: [] }));
+  }, []);
+  if (!vault && (!list?.available || list.vaults.length === 0)) return null;
+  const names = list?.vaults.map((v) => v.name) ?? [];
+  if (vault && !names.includes(vault)) names.unshift(vault);
+  return (
+    <select
+      className={`max-w-[11rem] truncate rounded-full border px-2 py-0.5 text-xs outline-none ${vault ? "border-accent/60 bg-accent/10 text-zinc-100" : "border-line bg-panel-2 text-zinc-400"}`}
+      title="Lumina knowledge vault consulted by insights and chat"
+      value={vault ?? ""}
+      disabled={disabled || saving || !onVault}
+      onChange={async (e) => {
+        if (!onVault) return;
+        setSaving(true);
+        try {
+          await onVault(e.target.value || null);
+        } finally {
+          setSaving(false);
+        }
+      }}
+    >
+      <option value="">No vault</option>
+      {names.map((n) => (
+        <option key={n} value={n}>
+          Vault: {n}
+        </option>
+      ))}
+    </select>
+  );
 }
 
 function TitleEditor({ title, onRename }: { title: string; onRename?: (title: string) => Promise<void> }) {
@@ -130,6 +169,7 @@ export function TopBar({
   onRename,
   loadContext,
   onContext,
+  onVault,
 }: Props) {
   const live = status.mode === "live";
   const paused = status.state === "paused";
@@ -176,6 +216,7 @@ export function TopBar({
           </Chip>
         )}
         {status.llm_offline && <Chip tone="error">LLM unavailable</Chip>}
+        <VaultSelect vault={status.vault ?? null} disabled={stopped} onVault={editable ? onVault : undefined} />
         {editable && loadContext && onContext && (
           <button
             className="rounded-full border border-line px-2.5 py-0.5 text-xs text-zinc-300 hover:bg-panel-2"

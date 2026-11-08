@@ -300,6 +300,9 @@ export default function App() {
                     run(() => window.echo.invoke("meetings.update", { id: state.meetingId!, context }), "Context updated")
                 : undefined
             }
+            onVault={(vault) =>
+              run(() => window.echo.invoke("session.set_vault", { vault }), vault ? `Using vault ${vault}` : "Vault cleared")
+            }
           />
           <main className="grid min-h-0 flex-1 grid-cols-[minmax(0,3fr)_minmax(0,2fr)] gap-3 p-3">
             <div className="flex min-h-0 flex-col gap-3">

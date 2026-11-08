@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from echo.search import SearchHit
+from echo.wiki import WikiHit, WikiPage
 
 _openai_client_cache: dict[str, object] = {}
 _anthropic_client_cache: object | None = None
@@ -87,6 +88,9 @@ def _build_insight_route_prompt(
     meeting_title: str = "",
     meeting_context: str = "",
     dictionary_terms: "object" = (),
+    vault: str | None = None,
+    vault_titles: list[str] | None = None,
+    vault_hits: list[WikiHit] | None = None,
 ) -> str:
     agent = _agent_digest_for_prompt()
     core = INSIGHT_ROUTE_CORE.replace("<<<AGENT>>>", agent.strip())
@@ -94,12 +98,68 @@ def _build_insight_route_prompt(
     core = core.replace("<<<MEETING_CONTEXT>>>", ctx_block)
     core = core.replace("<<<MEETING_TITLE>>>", _meeting_title_for_prompt(meeting_title))
     core = core.replace("<<<DICTIONARY>>>", _dictionary_block(dictionary_terms))
+    if vault:
+        core = _with_vault_routing(core, vault, vault_titles or [], vault_hits or [])
     prompt = _embed_snippet(core, snippet)
     if not segments:
         return prompt.replace("<<<SEGMENTS>>>", "(none)")
     lines = [f"{sid}: {txt.strip()}" for sid, txt in segments if txt.strip()]
     blob = "\n".join(lines) if lines else "(none)"
     return prompt.replace("<<<SEGMENTS>>>", blob)
+
+
+_VAULT_TITLES_CHAR_CAP = 1500
+
+
+def _with_vault_routing(core: str, vault: str, titles: list[str], hits: list[WikiHit]) -> str:
+    """Offer the ``wiki_lookup`` action when the meeting has a knowledge vault attached."""
+    shown: list[str] = []
+    used = 0
+    for t in titles:
+        t = " ".join(str(t).split())
+        if not t:
+            continue
+        used += len(t) + 4
+        if used > _VAULT_TITLES_CHAR_CAP:
+            break
+        shown.append(f"- {t}")
+    titles_blob = "\n".join(shown) if shown else "(titles unavailable)"
+    hit_lines = []
+    for h in hits:
+        excerpt = " ".join(h.excerpt.split())[:140]
+        hit_lines.append(f"- {h.title} (`{h.filename}`){' — ' + excerpt if excerpt else ''}")
+    hits_blob = "\n".join(hit_lines) if hit_lines else "(no keyword matches)"
+    core = core.replace(
+        '- "action": either "comment" or "web_search"',
+        '- "action": one of "comment", "web_search", or "wiki_lookup"',
+    ).replace(
+        'If action is "web_search": empty string "".',
+        'If action is "web_search" or "wiki_lookup": empty string "".',
+    )
+    core = core.replace(
+        '- "reason": one short line explaining the routing choice.',
+        '- "wiki_query": string. If action is "wiki_lookup": concise keywords to search the knowledge vault '
+        '(use the vault\'s wording when a page title matches). Otherwise empty string "".\n'
+        '- "reason": one short line explaining the routing choice.',
+    )
+    core = core.replace(
+        '- "comment" when the chunk is mostly coordination, status, opinions, or Q&A answerable from context alone without external facts.',
+        '- "comment" when the chunk is mostly coordination, status, opinions, or Q&A answerable from context alone, '
+        "**and** no page of the knowledge vault below is relevant.",
+    )
+    return core.replace(
+        '- If factual claims need verification, prefer "web_search".',
+        '- If factual claims need verification, prefer "web_search".\n'
+        '- "wiki_lookup" when the chunk discusses a concept, framework, decision, person, project, or client that the '
+        "user's own knowledge vault covers — in particular when the subject matches or closely relates to a page title "
+        "below. This applies to internal discussions too: connecting what is said to what the user already knows is the "
+        'point of the vault. Prefer "web_search" only for fresh public facts (news, prices, statistics). '
+        "Do not pick it for a mere loose word overlap with a title.\n\n"
+        f"Knowledge vault attached to this meeting: {vault}\n"
+        "Vault pages returned by a keyword search on this chunk (can be loose; judge relevance yourself):\n"
+        f"<<<\n{hits_blob}\n>>>\n"
+        f"Other page titles in the vault (a sample, not exhaustive):\n<<<\n{titles_blob}\n>>>",
+    )
 
 
 def _strip_code_fence(text: str) -> str:
@@ -339,6 +399,41 @@ Web excerpts (may be empty):
 Rules: same primary language as the transcript; **McKinsey-style executive blurb**—**lead with the takeaway** (pyramid), then tight supporting lines only from excerpts + transcript; **at most 2 short paragraphs** OR **one** paragraph + **up to 3** tight bullets; **hard cap ~110 words** total; declarative; no JSON; no long lists."""
 
 
+INSIGHT_WIKI_SYNTH_TEMPLATE = """You write a **very brief** blurb for people **in a live meeting** (they have seconds, not minutes), drawing on the user's own **knowledge vault** (an LLM-maintained personal wiki named "<<<VAULT>>>").
+
+The transcript chunk may already be ASR-corrected (cleaned wording, same facts).
+
+Meeting (provided by user):
+- Title: <<<MEETING_TITLE>>>
+- Background/context:
+<<<
+<<<MEETING_CONTEXT>>>
+>>>
+
+Preferred glossary (spelling reference only — not a topic list, not extra facts):
+<<<
+<<<DICTIONARY>>>
+>>>
+
+Transcript chunk:
+<<<
+<<<SNIPPET>>>
+>>>
+
+Vault search query: <<<QUERY>>>
+
+Vault pages and excerpts (may be empty; filenames in backticks):
+<<<
+<<<SOURCES>>>
+>>>
+
+Rules:
+- Connect what is being said **now** to what the vault already knows (prior decisions, definitions, people, numbers, open questions). Use only facts from the vault pages and the transcript.
+- Cite the pages you used inline by filename, e.g. (`wiki/concepts/pricing.md`).
+- If the vault does not really cover the point, say so in one line instead of stretching.
+- Same primary language as the transcript; **McKinsey-style executive blurb**—**lead with the takeaway**; **at most 2 short paragraphs** OR **one** paragraph + **up to 3** tight bullets; **hard cap ~110 words**; declarative; no JSON."""
+
+
 MEETING_SUMMARY_TEMPLATE = """You write a **post-meeting summary** for the participants. People will read this **after** the meeting, not during it.
 
 Use the meeting title / background, the participant's own notebook, the (possibly long) transcript, and the per-pass insight comments produced live. The transcript may be slightly imperfect ASR; do **not** invent facts.
@@ -551,12 +646,13 @@ async def _openai_user_text(
 class InsightRouteResult:
     """LLM routing for one insight pass."""
 
-    action: Literal["comment", "web_search"]
+    action: Literal["comment", "web_search", "wiki_lookup"]
     comment: str
     search_query: str
     reason: str
     corrected_transcript: str = ""
     corrected_segments: list[tuple[int, str]] | None = None
+    wiki_query: str = ""
 
 
 def _parse_insight_route_json(text: str) -> InsightRouteResult | None:
@@ -566,8 +662,11 @@ def _parse_insight_route_json(text: str) -> InsightRouteResult | None:
     except json.JSONDecodeError:
         return None
     action_raw = str(data.get("action") or "").lower().strip()
-    if action_raw in ("web", "web_search", "search", "research", "lookup"):
-        action: Literal["comment", "web_search"] = "web_search"
+    action: Literal["comment", "web_search", "wiki_lookup"]
+    if action_raw in ("wiki_lookup", "wiki", "vault", "vault_lookup", "knowledge"):
+        action = "wiki_lookup"
+    elif action_raw in ("web", "web_search", "search", "research", "lookup"):
+        action = "web_search"
     else:
         action = "comment"
     comment = str(data.get("comment") or "").strip()
@@ -602,6 +701,7 @@ def _parse_insight_route_json(text: str) -> InsightRouteResult | None:
         reason=reason,
         corrected_transcript=corrected,
         corrected_segments=corrected_segments,
+        wiki_query=str(data.get("wiki_query") or "").strip(),
     )
 
 
@@ -612,8 +712,14 @@ async def llm_route_insight(
     meeting_context: str = "",
     meeting_title: str = "",
     dictionary_terms: "object" = (),
+    vault: str | None = None,
+    vault_titles: list[str] | None = None,
+    vault_hits: list[WikiHit] | None = None,
 ) -> InsightRouteResult:
-    """Ask LLM to choose comment-only vs web_search. Without API keys, returns a comment explaining missing config."""
+    """Ask LLM to choose comment / web_search (/ wiki_lookup when a vault is attached).
+
+    Without API keys, returns a comment explaining missing config.
+    """
     snippet = transcript_snippet.strip()
     if not snippet:
         return InsightRouteResult("comment", "", "", "", "")
@@ -624,6 +730,9 @@ async def llm_route_insight(
         meeting_context=meeting_context,
         meeting_title=meeting_title,
         dictionary_terms=dictionary_terms,
+        vault=vault,
+        vault_titles=vault_titles,
+        vault_hits=vault_hits,
     )
     raw, err = await _llm_user_text_with_retry(prompt, 768)
     if not raw.strip():
@@ -665,6 +774,13 @@ async def llm_route_insight(
             [],
         )
 
+    if parsed.action == "wiki_lookup":
+        if not vault:
+            parsed.action = "comment"
+            parsed.reason = (parsed.reason + " · " if parsed.reason else "") + "no_vault"
+        elif not parsed.wiki_query:
+            kws = extract_keywords_fallback(snippet)
+            parsed.wiki_query = parsed.search_query or (" ".join(kws[:4]) if kws else snippet[:120].strip())
     if parsed.action == "comment" and not parsed.comment:
         parsed = InsightRouteResult(
             "comment",
@@ -694,6 +810,7 @@ async def llm_route_insight(
         parsed.reason,
         final_ct,
         parsed.corrected_segments or [],
+        parsed.wiki_query if parsed.action == "wiki_lookup" else "",
     )
 
 
@@ -730,6 +847,55 @@ async def llm_synthesize_web_findings(
                 f"```\n{err}\n```"
             )
         return f"{preface}\n\n**Query:** `{query}`\n\n{_hits_bullets(hits)}"
+    return text
+
+
+def wiki_sources_block(hits: list[WikiHit], pages: list[WikiPage]) -> str:
+    """Vault pages (full, capped bodies) plus excerpts of the remaining hits, for prompts."""
+    if not hits and not pages:
+        return "(no matching pages)"
+    read = {p.filename for p in pages}
+    parts = [f"### {p.title} (`{p.filename}`)\n{p.body.strip() or '(empty page)'}" for p in pages]
+    rest = [h for h in hits if h.filename not in read]
+    if rest:
+        parts.append(
+            "Other matches (excerpts only):\n"
+            + "\n".join(f"- {h.title} (`{h.filename}`) — {' '.join(h.excerpt.split())}" for h in rest)
+        )
+    return "\n\n".join(parts)
+
+
+async def llm_synthesize_wiki_findings(
+    transcript_snippet: str,
+    query: str,
+    hits: list[WikiHit],
+    pages: list[WikiPage],
+    *,
+    vault: str,
+    meeting_context: str = "",
+    meeting_title: str = "",
+    dictionary_terms: "object" = (),
+) -> str:
+    """Turn transcript + knowledge-vault pages into a short blurb that cites ``wiki/...`` filenames."""
+    sources = wiki_sources_block(hits, pages)
+    prompt = _embed_synth(
+        INSIGHT_WIKI_SYNTH_TEMPLATE.replace("<<<VAULT>>>", vault),
+        transcript_snippet.strip(),
+        query.strip(),
+        sources,
+        meeting_context,
+        meeting_title,
+        dictionary_terms,
+    )
+    text, err = await _llm_user_text_with_retry(prompt, 512)
+    if not text.strip():
+        preface = (
+            "_LLM not configured; showing vault matches._"
+            if not _llm_is_configured()
+            else f"_LLM call failed after retries; showing vault matches._\n\n```\n{err}\n```"
+        )
+        listing = "\n".join(f"- **{h.title}** (`{h.filename}`)" for h in hits) or "- (no matching pages)"
+        return f"{preface}\n\n**Query:** `{query}`\n\n{listing}"
     return text
 
 
@@ -835,7 +1001,7 @@ def _format_insight_history(passes: list[tuple[str, str]]) -> str:
         body_text = (body or "").strip()
         if not body_text:
             continue
-        label = "Comment" if kind == "comment" else "Research summary"
+        label = {"comment": "Comment", "wiki": "Wiki lookup"}.get(kind, "Research summary")
         lines.append(f"### Pass {i} — {label}\n{body_text}")
     return "\n\n".join(lines) if lines else "(none)"
 
@@ -957,6 +1123,7 @@ async def llm_chat_answer(
     meeting_context: str = "",
     meeting_title: str = "",
     dictionary_terms: "object" = (),
+    wiki_excerpts: str = "",
 ) -> str:
     if key := os.environ.get("ANTHROPIC_API_KEY"):
         return await _anthropic_chat(
@@ -966,6 +1133,7 @@ async def llm_chat_answer(
             meeting_context,
             meeting_title,
             dictionary_terms,
+            wiki_excerpts,
         )
     if cfg := _litellm_openai_config():
         return await _openai_compatible_chat(
@@ -975,6 +1143,7 @@ async def llm_chat_answer(
             meeting_context,
             meeting_title,
             dictionary_terms,
+            wiki_excerpts,
         )
     if key := os.environ.get("OPENAI_API_KEY"):
         return await _openai_chat(
@@ -984,6 +1153,7 @@ async def llm_chat_answer(
             meeting_context,
             meeting_title,
             dictionary_terms,
+            wiki_excerpts,
         )
     return (
         "No API key detected. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, "
@@ -1076,6 +1246,7 @@ def _chat_prompt(
     meeting_context: str = "",
     meeting_title: str = "",
     dictionary_terms: "object" = (),
+    wiki_excerpts: str = "",
 ) -> str:
     title = _meeting_title_for_prompt(meeting_title)
     title_line = f"Meeting title: {title}\n" if title != "(none)" else ""
@@ -1098,10 +1269,18 @@ def _chat_prompt(
     header = f"{title_line}{glossary_line}{ctx}" if (title_line or glossary_line or ctx) else ""
     if header and not header.endswith("\n\n"):
         header = header.rstrip() + "\n\n"
+    wiki = (
+        f"{wiki_excerpts.strip()}\n\n"
+        "The knowledge-vault pages above come from the user's own wiki and were matched to the question by search. "
+        "Use them only if they are relevant; when you rely on one, cite its filename in backticks "
+        "(e.g. `wiki/concepts/x.md`). The transcript remains the source of truth for what was said in this meeting.\n\n"
+        if wiki_excerpts.strip()
+        else ""
+    )
     return (
         "You answer questions about a meeting using the transcript as context.\n"
         "Be concise. If unknown, say you do not know.\n\n"
-        f"{header}Transcript:\n{full_transcript}\n\nQuestion:\n{question}"
+        f"{header}{wiki}Transcript:\n{full_transcript}\n\nQuestion:\n{question}"
     )
 
 
@@ -1112,6 +1291,7 @@ async def _anthropic_chat(
     meeting_context: str = "",
     meeting_title: str = "",
     dictionary_terms: "object" = (),
+    wiki_excerpts: str = "",
 ) -> str:
     client = _get_anthropic_client(api_key)
     msg = await client.messages.create(
@@ -1126,6 +1306,7 @@ async def _anthropic_chat(
                     meeting_context,
                     meeting_title,
                     dictionary_terms,
+                    wiki_excerpts,
                 ),
             }
         ],
@@ -1140,6 +1321,7 @@ async def _openai_compatible_chat(
     meeting_context: str = "",
     meeting_title: str = "",
     dictionary_terms: "object" = (),
+    wiki_excerpts: str = "",
 ) -> str:
     base_url, api_key, model = cfg
     return await _openai_chat_completions(
@@ -1154,6 +1336,7 @@ async def _openai_compatible_chat(
                     meeting_context,
                     meeting_title,
                     dictionary_terms,
+                    wiki_excerpts,
                 ),
             }
         ],
@@ -1169,6 +1352,7 @@ async def _openai_chat(
     meeting_context: str = "",
     meeting_title: str = "",
     dictionary_terms: "object" = (),
+    wiki_excerpts: str = "",
 ) -> str:
     model = os.environ.get("ECHO_OPENAI_MODEL", "gpt-4o-mini")
     return await _openai_chat_completions(
@@ -1183,6 +1367,7 @@ async def _openai_chat(
                     meeting_context,
                     meeting_title,
                     dictionary_terms,
+                    wiki_excerpts,
                 ),
             }
         ],

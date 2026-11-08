@@ -12,17 +12,19 @@ from typing import Iterable, Literal
 
 from echo.llm import InsightRouteResult
 from echo.search import SearchHit
+from echo.wiki import WikiHit
 
 
 @dataclass
 class InsightPassRecord:
     n: int
     stamp: str
-    kind: Literal["comment", "web_search"]
+    kind: Literal["comment", "web_search", "wiki"]
     body_md: str
     routing_md: str | None = None
     corrected_md: str | None = None
     web_md: str | None = None
+    vault: str | None = None
 
 
 @dataclass
@@ -440,7 +442,9 @@ def _spoken_lines_after_correction(source_spoken: list[str], corrected: str) -> 
     return parts
 
 
-def _insight_routing_collapsible(route: InsightRouteResult, *, web_path: bool) -> str | None:
+def _insight_routing_collapsible(route: InsightRouteResult, *, web_path: bool, wiki_path: bool = False) -> str | None:
+    if wiki_path:
+        return f"**Choice:** knowledge vault lookup\n\n**Reason:** {route.reason or '—'}"
     if web_path:
         return f"**Choice:** web search\n\n**Reason:** {route.reason or '—'}"
     if route.reason in ("", "no_llm"):
@@ -467,6 +471,23 @@ def _format_web_search_md(query: str, hits: list[SearchHit], search_err: str, *,
                 lines.append(f"- **{title}** — {body}")
     else:
         lines.append("- (no results, offline, or error above)")
+    return "\n".join(lines).strip()
+
+
+def _format_wiki_md(query: str, hits: list[WikiHit], err: str, *, vault: str) -> str:
+    lines: list[str] = []
+    if err:
+        lines.extend([f"> {err}", ""])
+    if query.strip():
+        lines.extend([f"_Query:_ `{query}` · _vault {vault}_", ""])
+    if hits:
+        for h in hits:
+            excerpt = " ".join((h.excerpt or "").split())
+            if len(excerpt) > 160:
+                excerpt = excerpt[:160].rstrip() + "…"
+            lines.append(f"- **{h.title or h.filename}** (`{h.filename}`) — {excerpt}" if excerpt else f"- **{h.title or h.filename}** (`{h.filename}`)")
+    else:
+        lines.append("- (no matching pages)")
     return "\n".join(lines).strip()
 
 
