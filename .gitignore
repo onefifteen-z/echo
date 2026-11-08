@@ -12,5 +12,6 @@ echo_transcript_*.txt
 log/
 .DS_Store
 .obsidian/
+.vscode/
 dictionary.yml
 !dictionary.yml.example
