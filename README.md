@@ -443,6 +443,11 @@ cd gui && npm install && npm run dev
 npm run typecheck && npm test && npm run build
 npm run package
 
+# Build and install to /Applications with a stable local signature (keeps macOS permissions
+# such as Screen Recording across reinstalls). Create the identity once first.
+./scripts/create-signing-cert.sh
+npm run install:local
+
 # Regenerate app icons (gui/assets/icons) after editing echo-icon.svg
 npm run icons
 ```
