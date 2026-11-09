@@ -655,11 +655,50 @@ class InsightRouteResult:
     wiki_query: str = ""
 
 
-def _parse_insight_route_json(text: str) -> InsightRouteResult | None:
+_ROUTE_STRING_FIELDS = ("action", "comment", "search_query", "wiki_query", "reason", "corrected_transcript")
+
+
+def _loads_json_object_lenient(text: str) -> dict[str, Any] | None:
+    """Parse an LLM's JSON object, repairing common slips (unquoted / half-quoted keys, trailing commas)."""
     raw = _strip_code_fence(text)
+    start, end = raw.find("{"), raw.rfind("}")
+    candidates = [raw] + ([raw[start : end + 1]] if 0 <= start < end else [])
+    for cand in candidates:
+        try:
+            data = json.loads(cand)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    if not 0 <= start < end:
+        return None
+    body = raw[start : end + 1]
+    body = re.sub(r'([{,]\s*)"?([A-Za-z_][\w-]*)"?(\s*:)', r'\1"\2"\3', body)
+    body = re.sub(r",(\s*[}\]])", r"\1", body)
     try:
-        data: Any = json.loads(raw)
+        data = json.loads(body)
     except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _salvage_route_fields(text: str) -> dict[str, Any] | None:
+    """Last resort for badly broken JSON: pull the known string fields out one by one."""
+    out: dict[str, Any] = {}
+    for key in _ROUTE_STRING_FIELDS:
+        m = re.search(rf'"?{key}"?\s*:\s*"((?:[^"\\]|\\.)*)"', text, flags=re.S)
+        if not m:
+            continue
+        try:
+            out[key] = json.loads(f'"{m.group(1)}"')
+        except json.JSONDecodeError:
+            out[key] = m.group(1)
+    return out if out.get("action") else None
+
+
+def _parse_insight_route_json(text: str) -> InsightRouteResult | None:
+    data = _loads_json_object_lenient(text) or _salvage_route_fields(text)
+    if data is None:
         return None
     action_raw = str(data.get("action") or "").lower().strip()
     action: Literal["comment", "web_search", "wiki_lookup"]
@@ -678,6 +717,9 @@ def _parse_insight_route_json(text: str) -> InsightRouteResult | None:
         or data.get("cleaned_transcript")
         or "",
     ).strip()
+    # U+FFFD means the model/proxy mangled UTF-8; never write such text into the transcript.
+    if "\ufffd" in corrected:
+        corrected = ""
     corrected_segments_raw = data.get("corrected_segments") or []
     corrected_segments: list[tuple[int, str]] = []
     if isinstance(corrected_segments_raw, list):
@@ -691,7 +733,7 @@ def _parse_insight_route_json(text: str) -> InsightRouteResult | None:
             except (TypeError, ValueError):
                 continue
             text_val = str(txt or "").strip()
-            if not text_val:
+            if not text_val or "\ufffd" in text_val:
                 continue
             corrected_segments.append((sid, text_val))
     return InsightRouteResult(
