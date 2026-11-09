@@ -5,6 +5,7 @@
   "description": "Echo desktop app: live meeting transcription + insights (Electron front-end for the Python echo-server sidecar)",
   "main": "dist/main/main/main.js",
   "private": true,
+  "license": "Apache-2.0",
   "scripts": {
     "dev": "concurrently -k -n renderer,main,preload,electron -c blue,green,magenta,cyan \"npm run dev:renderer\" \"npm run dev:main\" \"npm run dev:preload\" \"npm run dev:electron\"",
     "dev:renderer": "vite",

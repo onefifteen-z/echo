@@ -492,4 +492,6 @@ pyproject.toml
 
 ## License
 
-See model and dependency licenses (e.g. Kotoba-Whisper **Apache-2.0** on Hugging Face). This demo code is provided as-is for experimentation.
+Echo is licensed under the [Apache License 2.0](LICENSE).
+
+Models and dependencies have their own licenses (e.g. Kotoba-Whisper is Apache-2.0 on Hugging Face).

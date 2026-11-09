@@ -9,6 +9,7 @@
     { "from": "../echo", "to": "python/echo", "filter": ["**/*", "!**/__pycache__/**"] },
     { "from": "../pyproject.toml", "to": "python/pyproject.toml" },
     { "from": "../README.md", "to": "python/README.md" },
+    { "from": "../LICENSE", "to": "python/LICENSE" },
     { "from": "../AGENT.md", "to": "python/AGENT.md" },
     { "from": "native/MeetingWatch.swift", "to": "native/MeetingWatch.swift" }
   ],
