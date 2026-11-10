@@ -11,11 +11,21 @@
   <img alt="Live audio mode" src="https://img.shields.io/badge/Live-mic%20%2B%20system-2EA043" />
 </p>
 
-Echo is a **terminal (TUI) demo** for meeting-style workflows: live-ish transcript, periodic **web search** via the **[`ddgs`](https://pypi.org/project/ddgs/)** metasearch library (DuckDuckGo / Bing / … backends), plus optional **LLM** summaries, and a bottom **chat** panel for questions over the transcript.
+Echo is a meeting assistant: a live transcript (Apple on-device speech, a Whisper API or local Kotoba-Whisper), periodic **insights** from an **LLM** with **web search** and an optional **knowledge vault**, a **chat** over the transcript, your own notes, and a post-meeting **summary**.
 
-Built with [Textual](https://textual.textualize.io/).
+Most people use the **[desktop app](#desktop-app-gui)** (macOS, Electron). The same engine also runs as a **[terminal app](#terminal-app-tui)** built with [Textual](https://textual.textualize.io/).
 
 ## Features
+
+**Desktop app (macOS):**
+
+- **Setup dialog**: title, time, context, audio source (mic + system audio without extra drivers), language, speech engine, knowledge vault.
+- **Live view**: transcript with draft/final lines, insights with web results, meeting chat and a rich-text notebook (with screenshots).
+- **Meetings archive**: past meetings with time, duration, summary, notebook, transcript and insights; regenerate summaries later.
+- **Menu bar item** and **Zoom / Teams meeting detection** (start transcribing from a floating card).
+- **Settings view** for the LLM, speech recognition, web search and knowledge vault.
+
+**Terminal app (TUI):**
 
 - **Startup splash**: green **Braille-style ECHO** (Kiro-like dot logo) + short hints; any key / click or ~3.2s auto-dismiss (`ECHO_NO_SPLASH=1` to skip).
 - **Transcript panel**: timed lines as they arrive.
@@ -27,91 +37,80 @@ Built with [Textual](https://textual.textualize.io/).
   3. `--audio` a local file transcribed with **[Kotoba-Whisper v2.2](https://huggingface.co/kotoba-tech/kotoba-whisper-v2.2)** weights via Transformers (see below).
   4. **`--live`** real-time capture from the **microphone** plus an optional **second PortAudio input** (often a virtual loopback such as [BlackHole](https://github.com/ExistentialAudio/BlackHole) on macOS—**not required**; see **Zoom without BlackHole** below). Both paths are resampled to **16 kHz mono**; when two devices are set, Echo **mixes them 50/50** before ASR. List devices with `echo-tui --list-audio-devices`.
 
-## Requirements
+## Desktop app (`gui/`)
 
-- Python **3.10+**
-- A virtual environment is recommended (macOS Homebrew Python is PEP 668–managed).
+Requirements: macOS, Python 3.10+ (Homebrew recommended) and, to build from source, Node.js with npm. Meeting detection needs macOS 14+; Apple's SpeechAnalyzer needs macOS 26 (older versions fall back to `SFSpeechRecognizer`).
 
-## Install
+An Electron + React + Tailwind front end (same stack as Lumina) that drives the Python engine through a local WebSocket sidecar (`echo-server`). It has a setup dialog (title, time, context, audio source, language, speech engine, microphone, knowledge vault, Apple model download), live transcript with draft/final lines, level meter, status chips (ASR backend, mic-only warning, LLM availability), insights with collapsible web results, and meeting chat. Outputs go to `~/Documents/Echo/<YYYY-MM-DD HHMM> <title>/` by default (the folder can be changed in Settings; dated folders, so meetings with the same title never overwrite each other; the folder name is the meeting id). The files in each folder are listed under [Save output](#save-output-s).
 
-```bash
-cd prj-echo
-python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -e .
-```
-
-**Use a dedicated virtualenv, not a conda base env.** On Apple Silicon, macOS kills a process outright (`SIGKILL (Code Signature Invalid)`) when it loads a native extension whose arm64 signature is missing or modified. Long-lived conda base envs often contain such files (for example a modified `lib-dynload/_sqlite3`), and Echo imports several native modules lazily mid-session, so the symptom used to be a silent kill during a meeting plus mouse escape codes left in the terminal.
-
-- On startup, `echo-tui` and the desktop engine import the risky native modules in a child process first and exit with a message naming the broken module. A passing result is remembered per Python environment (`<venv>/.echo-preflight-ok`), so the check only runs again after packages or the interpreter change (`ECHO_SKIP_PREFLIGHT=1` disables it). The desktop engine pre-imports these modules in the background after it is ready.
-- Fatal-signal tracebacks are written to `./log/echo_crash_<timestamp>.log`.
-- `bin/echo-live` / `bin/echo-live-debug` prefer `.venv/bin/echo-tui` and restore the terminal on exit.
-- `echo-probe` reports the interpreter in use, arm64 signature problems, Apple speech model status, and a real Whisper API call.
-
-### Optional: local speech-to-text (`--audio`)
-
-ASR uses PyTorch + Transformers + Torchaudio. Install the extra group:
-
-```bash
-pip install -e ".[asr]"
-```
-
-The `[asr]` extra includes **torchcodec**, which recent **torchaudio** builds use to decode **MP3** and many other formats. **ffmpeg** should be on your `PATH` (e.g. `brew install ffmpeg` on macOS). If TorchCodec is awkward to install, `pip install librosa` is enough for Echo’s **librosa fallback** when torchaudio fails. **Live capture** also needs **`sounddevice`** (included in `[asr]`).
-
-First run downloads model weights from Hugging Face (large download; size depends on dtype/device).
-
-With `--audio`, weights are loaded **before** the TUI starts (main thread) to avoid macOS `bad value(s) in fds_to_keep` errors when Hugging Face spawns helpers from a background thread.
-
-> **Note:** The Hub “custom pipeline” for Kotoba-Whisper bundles **speaker diarization** (pyannote, etc.). Echo instead loads the same **`WhisperForConditionalGeneration`** checkpoint and runs **standard Japanese transcribe** in fixed time windows—no diarization, so you do not need pyannote tokens for this demo.
-
-## Usage
-
-The installed command is **`echo-tui`** (not `echo`). In zsh/bash, `echo` is almost always the **shell builtin**, so typing `echo --replay …` never starts this app—it only prints arguments.
-
-```bash
-# Built-in demo transcript
-echo-tui
-
-# Replay a UTF-8 file (one utterance per line; timestamps added if missing)
-echo-tui --replay samples/sample_transcript.txt --line-delay 0.8
-
-# Transcribe a local audio file (wav / mp3 / flac / …)
-echo-tui --audio path/to/meeting.wav
-
-# Live: mic + second input (e.g. loopback device index from --list-audio-devices)
-echo-tui --list-audio-devices
-echo-tui --live --live-mic-device 0 --live-system-device 2 --chunk-seconds 5
-
-# Live without BlackHole: use bundled ScreenCaptureKit helper + mic
-echo-tui --live --live-system-authorized
-
-# Simple live shortcuts (no long argument list)
-./bin/echo-live
-./bin/echo-live-debug
-
-# ASR options
-echo-tui --audio meeting.wav --chunk-seconds 30 --model-id kotoba-tech/kotoba-whisper-v2.2
-echo-tui --audio meeting.wav --whisper-device cuda   # local Kotoba only: cpu, cuda, mps
-echo-tui --live --asr-backend apple                  # force Apple on-device (macOS)
-echo-tui --live --asr-backend api                    # force Whisper API
-echo-tui --live --asr-backend local                  # force local Kotoba-Whisper
-echo-tui --install-apple-speech ja                   # one-time download of Apple's on-device ja model
-```
-
-Same entry point without a script name clash (with the venv activated):
+- **Notebook:** during a meeting, the *My notebook* tab (next to chat) is a rich-text editor (headings, lists, checklists, tables; Markdown shortcuts such as `# ` and `- [ ] ` work) that autosaves into the session; it is written to `notebook.md` and included in the summary.
+  - **Images:** paste a screenshot, drag an image file in, or use *Image* in the toolbar (PNG, JPEG, GIF, WebP, up to 20 MB). Files are saved in the meeting folder under `notes-assets/` and linked from `notebook.md` as `![name](notes-assets/…)`. When the summary is generated (at the end of the meeting or with *Regenerate summary*), up to 8 notebook screenshots (the last ones, each under 3.75 MB) are sent to the LLM as images alongside the notes, so slides, whiteboards and shared documents count toward takeaways and next actions. If the model doesn't accept images, the summary is generated from text only and says so.
+- **Meeting time:** every meeting has a time (minute precision). It defaults to when recording started; set it in the setup dialog's *Time* field, or later under **Details**. Meetings started from the Zoom/Teams prompt use the moment the meeting was detected. The time is passed to the summary prompt and orders the meetings list.
+- **Meetings view** (left rail): lists past meetings (newest first by meeting time, searchable by title, context and summary) with time, a duration badge, line count and summary preview. A meeting shows:
+  - **Summary** with a *Regenerate summary* button (re-runs the LLM with transcript, insights, context and notebook).
+  - **Notebook** (editable, autosaved).
+  - **Transcript** and **Insights** (read-only).
+  - **Details**: editable time and context plus metadata (*Use start time* restores the default time).
+  - The header shows the meeting time and a duration badge. The title is editable inline; *Open folder* opens the meeting in Finder.
+  - *Delete* moves the folder to the macOS Trash, so it can be recovered.
+  - The meeting in progress is marked **Live**: edits go to the running session, while regenerate and delete wait until the meeting ends.
+- Folders written by older versions (no `meeting.json`) are still listed, using the folder name as title and its modification time as date.
+- **Menu bar icon (macOS):**
+  - While a meeting runs, it shows the elapsed time and a recording dot; it shows *Paused* when paused.
+  - Its menu has the meeting status, *Open Echo*, *New meeting…*, *Pause* / *Resume*, *Stop meeting* and *Quit Echo*.
+  - Closing the window keeps Echo running in the Dock and the menu bar.
+  - On MacBooks with a notch, macOS hides menu bar icons that don't fit. If Echo's is missing, ⌘-drag it further right, or remove other menu bar items.
+- **Meeting detection (macOS 14+):** when the Zoom or Microsoft Teams desktop app starts using the microphone, Echo shows a floating *meeting detected* card in the top-right corner.
+  - *Start transcribing* starts right away with the source, engine, language and mic of your last meeting. The title comes from the meeting window, or falls back to "Zoom meeting 14:05". The meeting time is when the meeting was detected (Zoom and Teams don't expose the scheduled time).
+  - The chevron menu has *Set up first…* (opens the setup dialog with the title and time filled in), *Don't ask for Zoom/Teams* and *Turn off meeting detection*.
+  - The card closes by itself after 45 seconds, or when the meeting ends. It never takes focus from the meeting app, and it isn't shown while an Echo meeting is already running.
+  - Turn detection on or off, and re-enable muted apps, under **Settings → Meeting detection**.
+  - Requirements: the Xcode Command Line Tools (`xcode-select --install`). Echo compiles a small watcher helper the first time. Meeting titles need the **Screen Recording** permission; without it, the fallback title is used. Browser meetings (Zoom or Teams on the web) are not detected.
+  - Development: `ECHO_DEV_FAKE_ZOOM_BUNDLE=org.python.python npm run dev` treats any Python process using the mic as Zoom, so `python -c "import sounddevice"`-style captures can trigger the card.
+- **Knowledge vault:** optionally attach a Lumina vault in the setup dialog or from the top bar; insights and chat then consult its wiki on demand (see [Knowledge vault (Lumina)](#knowledge-vault-lumina)).
+- **Editing a live meeting:** click the title in the top bar to rename it, and use *Context…* to edit the meeting context; changes are saved to the running session and its `meeting.json`.
+- **Settings view** (bottom of the left rail): edits the engine configuration for the desktop app.
+  - **Groups:** Workspace (meetings folder, glossary file), Language model, Speech recognition (default engine, Whisper API, local device, Apple on-device model status with *Download*), Web search, Knowledge vault (Lumina app path and the vaults Echo can see), Insights & transcript, Network & debugging.
+  - **Advanced:** any other variable from [Environment variables](#environment-variables).
+  - **Source badges:** each field shows where its current value comes from, *Echo settings* or *.env* (shell environment / `.env`). An empty field uses the built-in default, shown as the placeholder.
+  - **Storage:** settings are stored in `~/Library/Application Support/Echo/settings.json`. Values whose name contains `KEY`, `TOKEN`, `SECRET` or `PASSWORD` are encrypted with the macOS Keychain (Electron `safeStorage`) and never sent back to the window.
+  - **Precedence:** values from settings are passed to the engine as environment variables, so they override your shell and `.env`. *Remove override* falls back to those again. The terminal app (`echo`) does not read these settings.
+  - **Saving:** saving restarts the engine. If a meeting is running, you can end it (it is saved first) and restart, or save now and apply later.
+  - **Meetings folder:** changing it affects new meetings and the Meetings list; existing folders are not moved.
 
 ```bash
-python -m echo --replay samples/sample_transcript.txt --line-delay 0.8
+# Development (uses the repo .venv: python3 -m venv .venv && .venv/bin/pip install -e '.[asr]')
+cd gui && npm install && npm run dev
+
+# Type-check / unit tests / production build / macOS package
+npm run typecheck && npm test && npm run build
+npm run package
+
+# Build and install to /Applications with a stable local signature (keeps macOS permissions
+# such as Screen Recording across reinstalls). Create the identity once first.
+./scripts/create-signing-cert.sh
+npm run install:local
+
+# Regenerate app icons (gui/assets/icons) after editing echo-icon.svg
+npm run icons
 ```
 
-### Test LLM + web search (no TUI)
+- **Python runtime:** in development the app runs `../.venv/bin/python -m echo.server`. A packaged app bundles the `echo` sources and on first launch creates **`~/.echo/venv`** (needs Python ≥ 3.10, Homebrew preferred) and installs Echo into it; it is re-installed when the app version changes.
+- **Configuration:** the packaged app reads **`~/.echo/.env`** (see [Configuration](#configuration)). In development the repo `.env` is used. Values from the Settings view take precedence over both.
+- **Permissions:** the app requests **Microphone** access; **Speech Recognition** and **Screen & System Audio Recording** prompts appear the first time Apple ASR or system-audio capture is used. macOS ties these grants to the app's signature: an ad-hoc signed build gets a new signature on every rebuild, so system-audio capture fails with `permissionDenied` until you grant access again. Install with `npm run install:local` (stable local signature) to keep the grants across reinstalls; if a stale grant is stuck, run `tccutil reset ScreenCapture com.echo.app` and relaunch.
+- **Crashes:** if the sidecar dies it is restarted automatically (up to 3 times per minute); after that the window shows the error tail and a *Restart engine* button. Sidecar logs: `~/Library/Application Support/Echo/echo-sidecar.log`. Set `ECHO_PYTHON=/path/to/python` to use a specific interpreter.
 
-```bash
-echo-probe
-# optional: echo-probe --llm-timeout 60 --ddg-timeout 20 --ddg-query "your query"
-```
+### Sidecar protocol (`echo-server`)
 
-Loads the same `.env` rules as the app (repo root then cwd), prints which LLM route is active, runs one small **keywords/summary** call and one web search (Perplexity when configured, else ddgs; prints the provider), then exits `0` / `1`.
+`echo-server [--host 127.0.0.1] [--port 0] [--output-root DIR]` prints one JSON line `{"port", "token", "protocol"}` to stdout, then serves `ws://127.0.0.1:<port>/?token=<token>`. It exits on SIGTERM or when stdin closes. Messages are JSON:
+
+- Request `{"id", "cmd", "args"}` → response `{"id", "ok", "result" | "error"}`.
+- Commands: `ping`, `probe`, `devices.list`, `apple.status`, `apple.install_assets`, `session.start` (`title`, `context`, `source`: `mic`/`both`/`system`/`demo`, `backend`, `language`, `mic_device`, `chunk_seconds`, `line_delay`, optional `vault`, optional `meeting_time` as ISO 8601, floored to the minute), `session.stop`, `session.pause`, `session.resume`, `session.reset`, `session.set_language`, `session.save`, `session.snapshot`, `session.notebook.set` (`text`), `chat.ask`, `meetings.list`, `meetings.get` (`id`), `meetings.update` (`id`, optional `title` / `context` / `notebook` / `meeting_time`; `""` resets the time to the start time), `meetings.regenerate_summary` (`id`; emits `summary.written` with `id`), `config.effective` (`keys`; returns `{value, source: app|env|default, secret}` per key, with secret values masked), `wiki.vaults` (returns `{available, reason?, vaults: [{name, path, default, initialized}]}`), `session.set_vault` (`vault`: name or `null`). `probe` also reports the active web search provider. Deleting is done by the Electron main process (`shell.trashItem`), not the sidecar.
+- Server-pushed events `{"event": {...}}` mirror `echo/engine/events.py` (`transcript.draft`, `transcript.final`, `transcript.corrected`, `insight.pending`, `insight.pass`, `meter`, `status`, `notice`, `chat.reply`, `summary.written`, `session.ended`, …).
+
+## Configuration
+
+Shared by the desktop app and the terminal app. In the desktop app most of these can be set in **Settings**, which override the shell and `.env`.
 
 ### Environment variables
 
@@ -189,77 +188,6 @@ If the **Insights** panel stays on “Updating…”, it was usually a **hung or
 
 If no LLM configuration is detected, Echo still runs: keywords use a small heuristic, summaries note that LLM is off, and chat replies tell you to set a key.
 
-### Web search
-
-Insight passes routed to **web search** use **Perplexity Sonar** when `ECHO_PERPLEXITY_BASE_URL` (or `AI_GATEWAY_PERPLEXITY_BASE_URL`) and a key are set; only **cited URLs** become results. If Perplexity is not configured, errors (auth, quota, rate limit, timeout) or returns no citations, Echo falls back to the keyless **ddgs** metasearch (`auto` → `bing` → `duckduckgo` → `yahoo`, or just `ECHO_DDGS_BACKEND`). The Insights web section shows which provider answered and any fallback reason; `echo-probe` reports the active provider.
-
-### Knowledge vault (Lumina)
-
-A meeting can optionally use one of your [Lumina](../prj-lumina) vaults (an LLM-maintained personal wiki) as extra context. Pick it in the setup dialog under *Knowledge vault (optional)*, or switch or clear it during the meeting from the vault pill in the top bar.
-
-- **Insights:** when a vault is attached, the insight router gets a third action, `wiki_lookup`, next to `comment` and `web_search`. It sees the vault name and some page titles, and picks `wiki_lookup` when the conversation touches topics, people, projects, clients or past decisions the wiki likely covers. Echo then searches the vault, reads the top pages and writes a short *From <vault>* insight that cites the `wiki/...` pages; the matched pages are listed under *Vault pages*.
-- **Chat:** every question is also searched in the vault; matching pages are added to the prompt, and the answer uses them only when relevant (with the filename cited).
-- **Failures never block the meeting:** if Lumina is slow, missing or errors, the insight says so in one line and the next pass carries on; chat simply answers without the vault.
-- **How it connects:** Echo starts Lumina's bundled MCP server over stdio (`ELECTRON_RUN_AS_NODE=1 Lumina.app/Contents/MacOS/Lumina …/app.asar/dist/main/mcp/cli.js --vault <path>`), one process per vault in use. Lumina doesn't need to be running. Echo only calls read tools (`search_wiki`, `get_article`, `list_articles`). The vault list is Lumina's own vault history (`~/Library/Application Support/Lumina/llm-wiki-config.json`). The first start of a vault can take up to a minute (index load, OneDrive); Echo warms it up in the background when the vault is selected.
-- **Overrides:** `ECHO_LUMINA_APP` (path to `Lumina.app`; also under **Settings → Knowledge vault**), `ECHO_LUMINA_MCP_CMD` (full CLI command, e.g. a dev build; `--vault` is appended), `ECHO_LUMINA_USER_DATA` (Lumina's userData folder).
-- The chosen vault is stored as `vault` in `meeting.json`, and remembered for the next meeting (including meetings started from the Zoom/Teams prompt).
-
-### Offline / LLM reachability
-
-- On startup Echo **TCP-probes the configured LLM host** (Anthropic, OpenAI, or your `BASE_URL`). If that fails—or no API keys are set—**Insights and chat are disabled**, but **Transcript** (replay, file ASR, or `--live`) still runs.
-- **`ECHO_ASSUME_ONLINE=1`**: skip the LLM probe (useful on split-tunnel / internal-only API routes).
-- **`ECHO_OFFLINE=1`**: force local Hugging Face cache for weights and treat the LLM as unavailable.
-- **`ECHO_HF_LOCAL_ONLY=1`**: load ASR weights from disk only (no Hub download) without forcing the LLM offline probe to fail.
-
-### Live audio (macOS)
-
-#### Option A — second *input* device (e.g. BlackHole / Loopback)
-
-macOS does not expose “what Zoom plays to your speakers” as a microphone. A **second input** is usually a **virtual loopback** (BlackHole, or paid tools such as **Loopback**—same idea, different vendor).
-
-1. Route Zoom’s **speaker** output through that loopback (often via a **Multi-Output Device** in Audio MIDI Setup: built-in speakers + loopback).
-2. `echo-tui --list-audio-devices` → pick **mic** + **loopback** indices or name substrings.
-3. `echo-tui --live --live-mic-device … --live-system-device …`  
-   Or build an **Aggregate Device** (mic + loopback) and pass **only** `--live-mic-device` to that aggregate.
-
-Echo does **not** ship or install audio drivers.
-
-In `--live` default mode (`ECHO_LIVE_EMIT_INTERVAL=0`), Transcript keeps one mutable draft line and finalizes it when one of these happens:
-
-- pause reaches `ECHO_LIVE_SEGMENT_PAUSE_SECONDS` (primary trigger),
-- sentence-ending punctuation is seen and draft length reaches `ECHO_UI_SEGMENT_SEMANTIC_MIN_CHARS`,
-- draft exceeds `ECHO_UI_SEGMENT_MAX_SECONDS` or `ECHO_UI_SEGMENT_MAX_CHARS` (forced split).
-
-Insights consume only new live content since the previous call and trigger on new chars / newly finalized segment / new duration / idle pause, with `ECHO_INSIGHT_LIVE_MIN_INTERVAL` as a hard rate limit.
-For debugging, Echo writes live debug events to `./log/echo_live_<timestamp>.log` (created from your launch directory).
-
-#### Option B — Zoom **without** BlackHole (system authorization mode)
-
-Echo supports a real-time path that mixes:
-
-- microphone from `sounddevice`, and
-- system output captured by a bundled macOS helper.
-
-By default, Echo auto-builds and runs `echo/macos/SystemAudioCapture.swift` on first use. The helper writes `s16le` stereo PCM @ 24kHz to stdout and uses **ScreenCaptureKit** by default (requires **Screen Recording** permission).
-
-Steps:
-
-1. Run Echo live mode:
-   `echo-tui --live --live-system-authorized`
-2. Approve the macOS prompt (microphone for your terminal app if not granted yet). For system output capture, grant **Screen Recording** permission.
-3. Optional: provide your own command instead of the bundled helper:
-   `echo-tui --live --live-system-authorized --live-system-authorized-cmd "/path/to/cmd"`
-4. Optional persistent override:
-   `export ECHO_SYSTEM_AUDIO_CMD="/path/to/cmd"`
-
-Notes:
-
-- `--live-system-authorized` cannot be combined with `--live-system-device`.
-- If helper build or system capture startup fails, Echo shows a startup error in Transcript.
-- Optional advanced path: on macOS 14.2+, set `ECHO_ENABLE_AUDIO_TAP=1` to opt into the Core Audio process-tap mode (System Audio Recording Only).
-
-Fallback (always works, no real-time requirements): Zoom/QuickTime recording → `echo-tui --audio file`.
-
 ### `.env` (python-dotenv)
 
 On startup, Echo loads **python-dotenv** in this order (variables already set in your shell are **not** overwritten):
@@ -288,6 +216,28 @@ Example `.env` at the repo root:
 ```
 
 Add `.env` to `.gitignore` (already in this repo) so keys are not committed.
+
+### Web search
+
+Insight passes routed to **web search** use **Perplexity Sonar** when `ECHO_PERPLEXITY_BASE_URL` (or `AI_GATEWAY_PERPLEXITY_BASE_URL`) and a key are set; only **cited URLs** become results. If Perplexity is not configured, errors (auth, quota, rate limit, timeout) or returns no citations, Echo falls back to the keyless **ddgs** metasearch (`auto` → `bing` → `duckduckgo` → `yahoo`, or just `ECHO_DDGS_BACKEND`). The Insights web section shows which provider answered and any fallback reason; `echo-probe` reports the active provider.
+
+### Knowledge vault (Lumina)
+
+A meeting can optionally use one of your [Lumina](../prj-lumina) vaults (an LLM-maintained personal wiki) as extra context. Pick it in the setup dialog under *Knowledge vault (optional)*, or switch or clear it during the meeting from the vault pill in the top bar.
+
+- **Insights:** when a vault is attached, the insight router gets a third action, `wiki_lookup`, next to `comment` and `web_search`. It sees the vault name and some page titles, and picks `wiki_lookup` when the conversation touches topics, people, projects, clients or past decisions the wiki likely covers. Echo then searches the vault, reads the top pages and writes a short *From <vault>* insight that cites the `wiki/...` pages; the matched pages are listed under *Vault pages*.
+- **Chat:** every question is also searched in the vault; matching pages are added to the prompt, and the answer uses them only when relevant (with the filename cited).
+- **Failures never block the meeting:** if Lumina is slow, missing or errors, the insight says so in one line and the next pass carries on; chat simply answers without the vault.
+- **How it connects:** Echo starts Lumina's bundled MCP server over stdio (`ELECTRON_RUN_AS_NODE=1 Lumina.app/Contents/MacOS/Lumina …/app.asar/dist/main/mcp/cli.js --vault <path>`), one process per vault in use. Lumina doesn't need to be running. Echo only calls read tools (`search_wiki`, `get_article`, `list_articles`). The vault list is Lumina's own vault history (`~/Library/Application Support/Lumina/llm-wiki-config.json`). The first start of a vault can take up to a minute (index load, OneDrive); Echo warms it up in the background when the vault is selected.
+- **Overrides:** `ECHO_LUMINA_APP` (path to `Lumina.app`; also under **Settings → Knowledge vault**), `ECHO_LUMINA_MCP_CMD` (full CLI command, e.g. a dev build; `--vault` is appended), `ECHO_LUMINA_USER_DATA` (Lumina's userData folder).
+- The chosen vault is stored as `vault` in `meeting.json`, and remembered for the next meeting (including meetings started from the Zoom/Teams prompt).
+
+### Offline / LLM reachability
+
+- On startup Echo **TCP-probes the configured LLM host** (Anthropic, OpenAI, or your `BASE_URL`). If that fails—or no API keys are set—**Insights and chat are disabled**, but **Transcript** (replay, file ASR, or `--live`) still runs.
+- **`ECHO_ASSUME_ONLINE=1`**: skip the LLM probe (useful on split-tunnel / internal-only API routes).
+- **`ECHO_OFFLINE=1`**: force local Hugging Face cache for weights and treat the LLM as unavailable.
+- **`ECHO_HF_LOCAL_ONLY=1`**: load ASR weights from disk only (no Hub download) without forcing the LLM offline probe to fail.
 
 ### VAD and denoising
 
@@ -367,6 +317,145 @@ acronyms: [FOMC, ARPU]
 Missing file = feature off (no warnings). Missing PyYAML = one-time hint in the debug log;
 LLM calls continue normally without the glossary.
 
+### Test LLM + web search (no TUI)
+
+```bash
+echo-probe
+# optional: echo-probe --llm-timeout 60 --ddg-timeout 20 --ddg-query "your query"
+```
+
+Loads the same `.env` rules as the app (repo root then cwd), prints which LLM route is active, runs one small **keywords/summary** call and one web search (Perplexity when configured, else ddgs; prints the provider), then exits `0` / `1`.
+
+## Terminal app (TUI)
+
+The terminal app (`echo-tui`) runs the same engine in a Textual UI: transcript, insights and chat panels, with demo, replay, audio-file and live input modes.
+
+### Requirements
+
+- Python **3.10+**
+- A virtual environment is recommended (macOS Homebrew Python is PEP 668–managed).
+
+### Install
+
+```bash
+cd prj-echo
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -e .
+```
+
+**Use a dedicated virtualenv, not a conda base env.** On Apple Silicon, macOS kills a process outright (`SIGKILL (Code Signature Invalid)`) when it loads a native extension whose arm64 signature is missing or modified. Long-lived conda base envs often contain such files (for example a modified `lib-dynload/_sqlite3`), and Echo imports several native modules lazily mid-session, so the symptom used to be a silent kill during a meeting plus mouse escape codes left in the terminal.
+
+- On startup, `echo-tui` and the desktop engine import the risky native modules in a child process first and exit with a message naming the broken module. A passing result is remembered per Python environment (`<venv>/.echo-preflight-ok`), so the check only runs again after packages or the interpreter change (`ECHO_SKIP_PREFLIGHT=1` disables it). The desktop engine pre-imports these modules in the background after it is ready.
+- Fatal-signal tracebacks are written to `./log/echo_crash_<timestamp>.log`.
+- `bin/echo-live` / `bin/echo-live-debug` prefer `.venv/bin/echo-tui` and restore the terminal on exit.
+- `echo-probe` reports the interpreter in use, arm64 signature problems, Apple speech model status, and a real Whisper API call.
+
+#### Optional: local speech-to-text (`--audio`)
+
+ASR uses PyTorch + Transformers + Torchaudio. Install the extra group:
+
+```bash
+pip install -e ".[asr]"
+```
+
+The `[asr]` extra includes **torchcodec**, which recent **torchaudio** builds use to decode **MP3** and many other formats. **ffmpeg** should be on your `PATH` (e.g. `brew install ffmpeg` on macOS). If TorchCodec is awkward to install, `pip install librosa` is enough for Echo’s **librosa fallback** when torchaudio fails. **Live capture** also needs **`sounddevice`** (included in `[asr]`).
+
+First run downloads model weights from Hugging Face (large download; size depends on dtype/device).
+
+With `--audio`, weights are loaded **before** the TUI starts (main thread) to avoid macOS `bad value(s) in fds_to_keep` errors when Hugging Face spawns helpers from a background thread.
+
+> **Note:** The Hub “custom pipeline” for Kotoba-Whisper bundles **speaker diarization** (pyannote, etc.). Echo instead loads the same **`WhisperForConditionalGeneration`** checkpoint and runs **standard Japanese transcribe** in fixed time windows—no diarization, so you do not need pyannote tokens for this demo.
+
+### Usage
+
+The installed command is **`echo-tui`** (not `echo`). In zsh/bash, `echo` is almost always the **shell builtin**, so typing `echo --replay …` never starts this app—it only prints arguments.
+
+```bash
+# Built-in demo transcript
+echo-tui
+
+# Replay a UTF-8 file (one utterance per line; timestamps added if missing)
+echo-tui --replay samples/sample_transcript.txt --line-delay 0.8
+
+# Transcribe a local audio file (wav / mp3 / flac / …)
+echo-tui --audio path/to/meeting.wav
+
+# Live: mic + second input (e.g. loopback device index from --list-audio-devices)
+echo-tui --list-audio-devices
+echo-tui --live --live-mic-device 0 --live-system-device 2 --chunk-seconds 5
+
+# Live without BlackHole: use bundled ScreenCaptureKit helper + mic
+echo-tui --live --live-system-authorized
+
+# Simple live shortcuts (no long argument list)
+./bin/echo-live
+./bin/echo-live-debug
+
+# ASR options
+echo-tui --audio meeting.wav --chunk-seconds 30 --model-id kotoba-tech/kotoba-whisper-v2.2
+echo-tui --audio meeting.wav --whisper-device cuda   # local Kotoba only: cpu, cuda, mps
+echo-tui --live --asr-backend apple                  # force Apple on-device (macOS)
+echo-tui --live --asr-backend api                    # force Whisper API
+echo-tui --live --asr-backend local                  # force local Kotoba-Whisper
+echo-tui --install-apple-speech ja                   # one-time download of Apple's on-device ja model
+```
+
+Same entry point without a script name clash (with the venv activated):
+
+```bash
+python -m echo --replay samples/sample_transcript.txt --line-delay 0.8
+```
+
+### Live audio (macOS)
+
+#### Option A — second *input* device (e.g. BlackHole / Loopback)
+
+macOS does not expose “what Zoom plays to your speakers” as a microphone. A **second input** is usually a **virtual loopback** (BlackHole, or paid tools such as **Loopback**—same idea, different vendor).
+
+1. Route Zoom’s **speaker** output through that loopback (often via a **Multi-Output Device** in Audio MIDI Setup: built-in speakers + loopback).
+2. `echo-tui --list-audio-devices` → pick **mic** + **loopback** indices or name substrings.
+3. `echo-tui --live --live-mic-device … --live-system-device …`  
+   Or build an **Aggregate Device** (mic + loopback) and pass **only** `--live-mic-device` to that aggregate.
+
+Echo does **not** ship or install audio drivers.
+
+In `--live` default mode (`ECHO_LIVE_EMIT_INTERVAL=0`), Transcript keeps one mutable draft line and finalizes it when one of these happens:
+
+- pause reaches `ECHO_LIVE_SEGMENT_PAUSE_SECONDS` (primary trigger),
+- sentence-ending punctuation is seen and draft length reaches `ECHO_UI_SEGMENT_SEMANTIC_MIN_CHARS`,
+- draft exceeds `ECHO_UI_SEGMENT_MAX_SECONDS` or `ECHO_UI_SEGMENT_MAX_CHARS` (forced split).
+
+Insights consume only new live content since the previous call and trigger on new chars / newly finalized segment / new duration / idle pause, with `ECHO_INSIGHT_LIVE_MIN_INTERVAL` as a hard rate limit.
+For debugging, Echo writes live debug events to `./log/echo_live_<timestamp>.log` (created from your launch directory).
+
+#### Option B — Zoom **without** BlackHole (system authorization mode)
+
+Echo supports a real-time path that mixes:
+
+- microphone from `sounddevice`, and
+- system output captured by a bundled macOS helper.
+
+By default, Echo auto-builds and runs `echo/macos/SystemAudioCapture.swift` on first use. The helper writes `s16le` stereo PCM @ 24kHz to stdout and uses **ScreenCaptureKit** by default (requires **Screen Recording** permission).
+
+Steps:
+
+1. Run Echo live mode:
+   `echo-tui --live --live-system-authorized`
+2. Approve the macOS prompt (microphone for your terminal app if not granted yet). For system output capture, grant **Screen Recording** permission.
+3. Optional: provide your own command instead of the bundled helper:
+   `echo-tui --live --live-system-authorized --live-system-authorized-cmd "/path/to/cmd"`
+4. Optional persistent override:
+   `export ECHO_SYSTEM_AUDIO_CMD="/path/to/cmd"`
+
+Notes:
+
+- `--live-system-authorized` cannot be combined with `--live-system-device`.
+- If helper build or system capture startup fails, Echo shows a startup error in Transcript.
+- Optional advanced path: on macOS 14.2+, set `ECHO_ENABLE_AUDIO_TAP=1` to opt into the Core Audio process-tap mode (System Audio Recording Only).
+
+Fallback (always works, no real-time requirements): Zoom/QuickTime recording → `echo-tui --audio file`.
+
 ### Keyboard shortcuts
 
 | Key | Action |
@@ -389,81 +478,13 @@ Pressing `s` writes the current meeting to its output directory:
 | `notebook.md` | Your own free-form notes (desktop app notebook; empty in the TUI). |
 | `notes-assets/` | Images pasted or dropped into the notebook (desktop app only). |
 | `insights.json` | Structured insight passes, used to regenerate the summary later. |
-| `meeting.json` | Metadata: id, title, context, start/end time, duration, mode, language, ASR backend, line count. |
+| `meeting.json` | Metadata: id, title, context, meeting time, start/end time, duration, mode, language, ASR backend, line count. |
 
 `summary.md` is rendered by the configured LLM using the transcript, the live insight comments,
 the meeting title / context, your notebook (treated as authoritative for decisions and action items), and the optional glossary. While the LLM call is in flight the file
 contains a `_Generating meeting summary…_` placeholder, then is overwritten when the response
 arrives. If no LLM provider is configured (or the call fails), `summary.md` falls back to a static
 markdown stub explaining how to enable it.
-
-## Desktop app (`gui/`)
-
-An Electron + React + Tailwind front end (same stack as Lumina) that drives the Python engine through a local WebSocket sidecar (`echo-server`). It has a setup dialog (title, context, audio source, language, speech engine, microphone, Apple model download), live transcript with draft/final lines, level meter, status chips (ASR backend, mic-only warning, LLM availability), insights with collapsible web results, and meeting chat. Outputs go to `~/Documents/Echo/<YYYY-MM-DD HHMM> <title>/` by default (the folder can be changed in Settings; dated folders, so meetings with the same title never overwrite each other; the folder name is the meeting id).
-
-- **Notebook:** during a meeting, the *My notebook* tab (next to chat) is a rich-text editor (headings, lists, checklists, tables; Markdown shortcuts such as `# ` and `- [ ] ` work) that autosaves into the session; it is written to `notebook.md` and included in the summary.
-  - **Images:** paste a screenshot, drag an image file in, or use *Image* in the toolbar (PNG, JPEG, GIF, WebP, up to 20 MB). Files are saved in the meeting folder under `notes-assets/` and linked from `notebook.md` as `![name](notes-assets/…)`. When the summary is generated (at the end of the meeting or with *Regenerate summary*), up to 8 notebook screenshots (the last ones, each under 3.75 MB) are sent to the LLM as images alongside the notes, so slides, whiteboards and shared documents count toward takeaways and next actions. If the model doesn't accept images, the summary is generated from text only and says so.
-- **Meetings view** (left rail): lists past meetings (newest first, searchable by title, context and summary) with date, duration, line count and summary preview. A meeting shows:
-  - **Summary** with a *Regenerate summary* button (re-runs the LLM with transcript, insights, context and notebook).
-  - **Notebook** (editable, autosaved).
-  - **Transcript** and **Insights** (read-only).
-  - **Details**: editable context plus metadata.
-  - The title is editable inline; *Open folder* opens the meeting in Finder.
-  - *Delete* moves the folder to the macOS Trash, so it can be recovered.
-  - The meeting in progress is marked **Live**: edits go to the running session, while regenerate and delete wait until the meeting ends.
-- Folders written by older versions (no `meeting.json`) are still listed, using the folder name as title and its modification time as date.
-- **Menu bar icon (macOS):**
-  - While a meeting runs, it shows the elapsed time and a recording dot; it shows *Paused* when paused.
-  - Its menu has the meeting status, *Open Echo*, *New meeting…*, *Pause* / *Resume*, *Stop meeting* and *Quit Echo*.
-  - Closing the window keeps Echo running in the Dock and the menu bar.
-  - On MacBooks with a notch, macOS hides menu bar icons that don't fit. If Echo's is missing, ⌘-drag it further right, or remove other menu bar items.
-- **Meeting detection (macOS 14+):** when the Zoom or Microsoft Teams desktop app starts using the microphone, Echo shows a floating *meeting detected* card in the top-right corner.
-  - *Start transcribing* starts right away with the source, engine, language and mic of your last meeting. The title comes from the meeting window, or falls back to "Zoom meeting 14:05".
-  - The chevron menu has *Set up first…* (opens the setup dialog with the title filled in), *Don't ask for Zoom/Teams* and *Turn off meeting detection*.
-  - The card closes by itself after 45 seconds, or when the meeting ends. It never takes focus from the meeting app, and it isn't shown while an Echo meeting is already running.
-  - Turn detection on or off, and re-enable muted apps, under **Settings → Meeting detection**.
-  - Requirements: the Xcode Command Line Tools (`xcode-select --install`). Echo compiles a small watcher helper the first time. Meeting titles need the **Screen Recording** permission; without it, the fallback title is used. Browser meetings (Zoom or Teams on the web) are not detected.
-  - Development: `ECHO_DEV_FAKE_ZOOM_BUNDLE=org.python.python npm run dev` treats any Python process using the mic as Zoom, so `python -c "import sounddevice"`-style captures can trigger the card.
-- **Knowledge vault:** optionally attach a Lumina vault in the setup dialog or from the top bar; insights and chat then consult its wiki on demand (see [Knowledge vault (Lumina)](#knowledge-vault-lumina)).
-- **Editing a live meeting:** click the title in the top bar to rename it, and use *Context…* to edit the meeting context; changes are saved to the running session and its `meeting.json`.
-- **Settings view** (bottom of the left rail): edits the engine configuration for the desktop app.
-  - **Groups:** Workspace (meetings folder, glossary file), Language model, Speech recognition (default engine, Whisper API, local device, Apple on-device model status with *Download*), Web search, Knowledge vault (Lumina app path and the vaults Echo can see), Insights & transcript, Network & debugging.
-  - **Advanced:** any other variable from the table above.
-  - **Source badges:** each field shows where its current value comes from, *Echo settings* or *.env* (shell environment / `.env`). An empty field uses the built-in default, shown as the placeholder.
-  - **Storage:** settings are stored in `~/Library/Application Support/Echo/settings.json`. Values whose name contains `KEY`, `TOKEN`, `SECRET` or `PASSWORD` are encrypted with the macOS Keychain (Electron `safeStorage`) and never sent back to the window.
-  - **Precedence:** values from settings are passed to the engine as environment variables, so they override your shell and `.env`. *Remove override* falls back to those again. The terminal app (`echo`) does not read these settings.
-  - **Saving:** saving restarts the engine. If a meeting is running, you can end it (it is saved first) and restart, or save now and apply later.
-  - **Meetings folder:** changing it affects new meetings and the Meetings list; existing folders are not moved.
-
-```bash
-# Development (uses the repo .venv: python3 -m venv .venv && .venv/bin/pip install -e '.[asr]')
-cd gui && npm install && npm run dev
-
-# Type-check / unit tests / production build / macOS package
-npm run typecheck && npm test && npm run build
-npm run package
-
-# Build and install to /Applications with a stable local signature (keeps macOS permissions
-# such as Screen Recording across reinstalls). Create the identity once first.
-./scripts/create-signing-cert.sh
-npm run install:local
-
-# Regenerate app icons (gui/assets/icons) after editing echo-icon.svg
-npm run icons
-```
-
-- **Python runtime:** in development the app runs `../.venv/bin/python -m echo.server`. A packaged app bundles the `echo` sources and on first launch creates **`~/.echo/venv`** (needs Python ≥ 3.10, Homebrew preferred) and installs Echo into it; it is re-installed when the app version changes.
-- **Configuration:** the packaged app reads **`~/.echo/.env`** (same variables as above). In development the repo `.env` is used. Values from the Settings view take precedence over both.
-- **Permissions:** the app requests **Microphone** access; **Speech Recognition** and **Screen & System Audio Recording** prompts appear the first time Apple ASR or system-audio capture is used.
-- **Crashes:** if the sidecar dies it is restarted automatically (up to 3 times per minute); after that the window shows the error tail and a *Restart engine* button. Sidecar logs: `~/Library/Application Support/Echo/echo-sidecar.log`. Set `ECHO_PYTHON=/path/to/python` to use a specific interpreter.
-
-### Sidecar protocol (`echo-server`)
-
-`echo-server [--host 127.0.0.1] [--port 0] [--output-root DIR]` prints one JSON line `{"port", "token", "protocol"}` to stdout, then serves `ws://127.0.0.1:<port>/?token=<token>`. It exits on SIGTERM or when stdin closes. Messages are JSON:
-
-- Request `{"id", "cmd", "args"}` → response `{"id", "ok", "result" | "error"}`.
-- Commands: `ping`, `probe`, `devices.list`, `apple.status`, `apple.install_assets`, `session.start` (`title`, `context`, `source`: `mic`/`both`/`system`/`demo`, `backend`, `language`, `mic_device`, `chunk_seconds`, `line_delay`, optional `vault`), `session.stop`, `session.pause`, `session.resume`, `session.reset`, `session.set_language`, `session.save`, `session.snapshot`, `session.notebook.set` (`text`), `chat.ask`, `meetings.list`, `meetings.get` (`id`), `meetings.update` (`id`, optional `title` / `context` / `notebook`), `meetings.regenerate_summary` (`id`; emits `summary.written` with `id`), `config.effective` (`keys`; returns `{value, source: app|env|default, secret}` per key, with secret values masked), `wiki.vaults` (returns `{available, reason?, vaults: [{name, path, default, initialized}]}`), `session.set_vault` (`vault`: name or `null`). `probe` also reports the active web search provider. Deleting is done by the Electron main process (`shell.trashItem`), not the sidecar.
-- Server-pushed events `{"event": {...}}` mirror `echo/engine/events.py` (`transcript.draft`, `transcript.final`, `transcript.corrected`, `insight.pending`, `insight.pass`, `meter`, `status`, `notice`, `chat.reply`, `summary.written`, `session.ended`, …).
 
 ## Project layout
 
