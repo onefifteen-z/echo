@@ -293,6 +293,7 @@ def test_app_save_schedules_async_summary_when_loop_running(
         dictionary_terms=(),
         notebook: str = "",
         assets_dir=None,
+        meeting_time: str = "",
     ) -> str:
         captured["transcript"] = transcript_text
         captured["title"] = meeting_title

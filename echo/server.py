@@ -308,6 +308,7 @@ class EchoServer:
             title = str(args.get("title") or "").strip()
             context = str(args.get("context") or "").strip()
             vault = self._vault_arg(args.get("vault"))
+            meeting_time = self._meeting_time_arg(args.get("meeting_time"))
             llm_ok = await asyncio.to_thread(echo_llm_online)
             output_dir = None
             if self.output_root is not None:
@@ -333,6 +334,7 @@ class EchoServer:
                     language=language,
                     vault=vault,
                     wiki=self.wiki,
+                    meeting_time=meeting_time,
                 )
             else:
                 system = source in ("both", "system")
@@ -365,6 +367,7 @@ class EchoServer:
                     language=language,
                     vault=vault,
                     wiki=self.wiki,
+                    meeting_time=meeting_time,
                 )
             session.set_meeting_metadata(session.meeting_title, session.meeting_context)
             self.session = session
@@ -400,6 +403,18 @@ class EchoServer:
         if not ok:
             raise CommandError(message)
         return {"message": message, "status": s.status().to_dict()}
+
+    @staticmethod
+    def _meeting_time_arg(raw: object) -> str | None:
+        value = str(raw or "").strip()
+        if not value:
+            return None
+        from echo.engine.text import normalize_meeting_time
+
+        try:
+            return normalize_meeting_time(value)
+        except ValueError as e:
+            raise CommandError(f"Invalid meeting_time: {value!r} (expected ISO 8601)") from e
 
     @staticmethod
     def _vault_arg(raw: object) -> str | None:
@@ -515,9 +530,14 @@ class EchoServer:
         title = args.get("title")
         context = args.get("context")
         notebook = args.get("notebook")
+        meeting_time = args.get("meeting_time")
+        if meeting_time is not None:
+            meeting_time = self._meeting_time_arg(meeting_time) or ""
         if mid == self._live_id():
             s = self.session
             assert s is not None
+            if meeting_time is not None:
+                s.set_meeting_time(meeting_time or None)
             if title is not None or context is not None:
                 s.set_meeting_metadata(
                     str(title) if title is not None else s.meeting_title,
@@ -533,6 +553,7 @@ class EchoServer:
                     title=str(title) if title is not None else None,
                     context=str(context) if context is not None else None,
                     notebook=str(notebook) if notebook is not None else None,
+                    meeting_time=meeting_time,
                 )
             )
         except MeetingNotFoundError as e:

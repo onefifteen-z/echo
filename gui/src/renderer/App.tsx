@@ -41,6 +41,7 @@ export default function App() {
   const [selectMeeting, setSelectMeeting] = useState<string | null>(null);
   const [settingsRev, setSettingsRev] = useState(0);
   const [setupTitle, setSetupTitle] = useState("");
+  const [setupTime, setSetupTime] = useState<string | undefined>(undefined);
   const [setupRev, setSetupRev] = useState(0);
   const chatSeq = useRef(0);
   const toastSeq = useRef(0);
@@ -153,6 +154,7 @@ export default function App() {
       if (cmd.kind === "stop") void stopMeeting();
       if (cmd.kind === "new") {
         setSetupTitle(cmd.title ?? "");
+        setSetupTime(cmd.meeting_time);
         setSetupRev((n) => n + 1);
         setShowSetup(true);
         setView("live");
@@ -255,7 +257,7 @@ export default function App() {
       ) : showSetup || !status ? (
         <div className="min-h-0 flex-1">
           {sidecar.phase === "ready" ? (
-            <SetupDialog key={`${settingsRev}-${setupRev}`} initialTitle={setupTitle} busy={starting} appleInstall={state.appleInstall} onStart={start} />
+            <SetupDialog key={`${settingsRev}-${setupRev}`} initialTitle={setupTitle} initialTime={setupTime} busy={starting} appleInstall={state.appleInstall} onStart={start} />
           ) : (
             <div className="pt-24 text-center text-sm text-zinc-500">Waiting for the Echo engine…</div>
           )}

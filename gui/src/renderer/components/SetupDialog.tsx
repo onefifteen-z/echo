@@ -1,17 +1,23 @@
 import { useEffect, useMemo, useState } from "react";
 import type { AsrBackendChoice, AudioSource, InputDevice, Language, ProbeResult, SessionStartArgs, WikiVaults } from "@shared/types";
+import { localInputToIso, toLocalInput } from "@shared/time";
 import type { AppleInstallView } from "../lib/session-store";
 import { appleLocaleState, Button, LANGUAGE_LABELS } from "./ui";
 
 interface Props {
   busy: boolean;
   initialTitle?: string;
+  /** Prefilled meeting time (ISO), e.g. when the meeting was detected. */
+  initialTime?: string;
   appleInstall: AppleInstallView | null;
   onStart: (args: SessionStartArgs) => Promise<void>;
 }
 
-export function SetupDialog({ busy, initialTitle = "", appleInstall, onStart }: Props) {
+export function SetupDialog({ busy, initialTitle = "", initialTime, appleInstall, onStart }: Props) {
   const [title, setTitle] = useState(initialTitle);
+  // Untouched and not prefilled: follows the clock, and the engine uses the actual start time.
+  const [time, setTime] = useState(() => toLocalInput(initialTime ? new Date(initialTime) : new Date()));
+  const [timeSet, setTimeSet] = useState(Boolean(initialTime));
   const [context, setContext] = useState("");
   const [source, setSource] = useState<AudioSource>("both");
   const [backend, setBackend] = useState<AsrBackendChoice>("auto");
@@ -60,6 +66,12 @@ export function SetupDialog({ busy, initialTitle = "", appleInstall, onStart }: 
   }, []);
 
   useEffect(() => {
+    if (timeSet) return;
+    const id = window.setInterval(() => setTime(toLocalInput(new Date())), 15_000);
+    return () => window.clearInterval(id);
+  }, [timeSet]);
+
+  useEffect(() => {
     window.echo
       .invoke("apple.status", { languages: [language] })
       .then(setAppleStatus)
@@ -85,8 +97,22 @@ export function SetupDialog({ busy, initialTitle = "", appleInstall, onStart }: 
 
   async function submit() {
     setError(null);
+    const meetingTime = timeSet ? localInputToIso(time) : null;
+    if (timeSet && !meetingTime) {
+      setError("Enter a valid meeting time, or clear the field to use the start time.");
+      return;
+    }
     try {
-      await onStart({ title, context, source, backend, language, mic_device: micDevice, vault: vault || null });
+      await onStart({
+        title,
+        context,
+        source,
+        backend,
+        language,
+        mic_device: micDevice,
+        vault: vault || null,
+        ...(meetingTime ? { meeting_time: meetingTime } : {}),
+      });
     } catch (e) {
       setError((e instanceof Error ? e.message : String(e)).replace(/^Error invoking remote method '[^']+': (Error: )?/, ""));
     }
@@ -103,9 +129,24 @@ export function SetupDialog({ busy, initialTitle = "", appleInstall, onStart }: 
         <p className="mb-5 text-sm text-zinc-400">Live transcription with insights. Outputs are saved under {workspace}.</p>
 
         <div className="space-y-4">
-          <div>
-            <label className={label}>Title</label>
-            <input className={field} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Weekly sync" />
+          <div className="grid grid-cols-3 gap-3">
+            <div className="col-span-2">
+              <label className={label}>Title</label>
+              <input className={field} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Weekly sync" />
+            </div>
+            <div>
+              <label className={label}>Time</label>
+              <input
+                type="datetime-local"
+                className={`${field} [color-scheme:dark]`}
+                value={time}
+                onChange={(e) => {
+                  setTime(e.target.value);
+                  setTimeSet(e.target.value !== "");
+                  if (e.target.value === "") setTime(toLocalInput(new Date()));
+                }}
+              />
+            </div>
           </div>
           <div>
             <label className={label}>Context (agenda, participants, background)</label>

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { KNOWN_APPS, MeetingDetector, appForBundle, meetingTitle } from "./meeting-detector";
 import type { WatchReport } from "./meeting-watch-service";
+import { localIsoMinute } from "../../shared/time";
 
 const ctx = { enabled: true, mutedApps: [] as string[], busy: false };
 const zoom = (windows: Record<string, string[]> = {}): WatchReport => ({ inputs: [{ pid: 10, bundle: "us.zoom.xos" }], windows });
@@ -12,7 +13,7 @@ describe("MeetingDetector", () => {
     const d = new MeetingDetector();
     expect(d.update(zoom(), ctx, at)).toEqual([]);
     const [p] = d.tick(zoom(), ctx, at + 2000);
-    expect(p).toEqual({ app: "zoom", appName: "Zoom", title: "Zoom meeting 09:05" });
+    expect(p).toEqual({ app: "zoom", appName: "Zoom", title: "Zoom meeting 09:05", detectedAt: localIsoMinute(new Date(at)) });
     expect(d.tick(zoom(), ctx, at + 4000)).toEqual([]);
   });
 
@@ -40,6 +41,15 @@ describe("MeetingDetector", () => {
     }
   });
 
+  it("reports when capture was first seen, not when the prompt fires", () => {
+    const d = new MeetingDetector({ startPolls: 3 });
+    d.update(zoom(), ctx, at + 30_000);
+    d.tick(zoom(), ctx, at + 70_000);
+    const [p] = d.tick(zoom(), ctx, at + 130_000);
+    expect(p.detectedAt).toBe(localIsoMinute(new Date(at)));
+    expect(p.detectedAt).toMatch(/^2026-11-06T09:05:00[+-]\d{2}:\d{2}$/);
+  });
+
   it("matches Teams helper processes by prefix and ignores other apps", () => {
     const d = new MeetingDetector({ startPolls: 1 });
     const r: WatchReport = {
@@ -49,7 +59,7 @@ describe("MeetingDetector", () => {
       ],
       windows: { "com.microsoft.teams2": ["Calendar | Microsoft Teams", "Weekly sync | Microsoft Teams"] },
     };
-    expect(d.update(r, ctx, at)).toEqual([{ app: "teams", appName: "Teams", title: "Weekly sync" }]);
+    expect(d.update(r, ctx, at)).toEqual([{ app: "teams", appName: "Teams", title: "Weekly sync", detectedAt: localIsoMinute(new Date(at)) }]);
     expect(appForBundle("org.python.python")).toBeUndefined();
   });
 });

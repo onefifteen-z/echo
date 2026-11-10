@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { localInputToIso, toLocalInput } from "@shared/time";
 import type { MeetingDetail, MeetingSummary } from "@shared/types";
 import { NotebookEditor } from "./NotebookEditor";
 import { Button, Chip } from "./ui";
@@ -38,7 +39,27 @@ export function formatDuration(s: number | null | undefined): string {
   if (s === null || s === undefined) return "";
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
-  return h > 0 ? `${h} h ${m} min` : m > 0 ? `${m} min` : `${s} s`;
+  return h > 0 ? `${h} h ${String(m).padStart(2, "0")} min` : m > 0 ? `${m} min` : `${s} s`;
+}
+
+/** When the meeting took place: the user-set time, else when recording started. */
+export function meetingTime(m: Pick<MeetingSummary, "meeting_time" | "started_at">): string {
+  return m.meeting_time || m.started_at;
+}
+
+function inputValue(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "" : toLocalInput(d);
+}
+
+function DurationBadge({ seconds }: { seconds: number | null | undefined }) {
+  if (!seconds) return null;
+  return (
+    <Chip title="Duration">
+      <span aria-hidden>⏱</span>
+      {formatDuration(seconds)}
+    </Chip>
+  );
 }
 
 function Md({ children }: { children: string }) {
@@ -64,6 +85,7 @@ export function MeetingsView({ refreshKey, selectId, onOpenLive, toast }: Props)
   const [regenerating, setRegenerating] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const [contextDraft, setContextDraft] = useState("");
+  const [timeDraft, setTimeDraft] = useState("");
 
   const loadList = useCallback(async () => {
     try {
@@ -84,6 +106,7 @@ export function MeetingsView({ refreshKey, selectId, onOpenLive, toast }: Props)
         setDetail(d);
         setTitleDraft(d.title);
         setContextDraft(d.context);
+        setTimeDraft(inputValue(meetingTime(d)));
       } catch (e) {
         setDetail(null);
         toast(errorText(e), "error");
@@ -115,7 +138,7 @@ export function MeetingsView({ refreshKey, selectId, onOpenLive, toast }: Props)
     return meetings.filter((m) => `${m.title}\n${m.context}\n${m.summary_preview}`.toLowerCase().includes(q));
   }, [meetings, query]);
 
-  async function update(patch: { title?: string; context?: string; notebook?: string }) {
+  async function update(patch: { title?: string; context?: string; notebook?: string; meeting_time?: string }) {
     if (!detail) return;
     const id = detail.id;
     const d = await window.echo.invoke("meetings.update", { id, ...patch });
@@ -123,10 +146,34 @@ export function MeetingsView({ refreshKey, selectId, onOpenLive, toast }: Props)
     setMeetings((ms) =>
       ms.map((m) =>
         m.id === id
-          ? { ...m, title: d.title, context: d.context, has_notebook: patch.notebook !== undefined ? !!patch.notebook.trim() : m.has_notebook }
+          ? {
+              ...m,
+              title: d.title,
+              context: d.context,
+              meeting_time: d.meeting_time,
+              has_notebook: patch.notebook !== undefined ? !!patch.notebook.trim() : m.has_notebook,
+            }
           : m,
       ),
     );
+    if (patch.meeting_time !== undefined) {
+      setTimeDraft(inputValue(meetingTime(d)));
+      void loadList();
+    }
+  }
+
+  async function saveTime(value: string) {
+    const iso = value === "" ? "" : localInputToIso(value);
+    if (iso === null) {
+      toast("Enter a valid date and time.", "error");
+      return;
+    }
+    try {
+      await update({ meeting_time: iso });
+      toast(iso ? "Meeting time saved." : "Meeting time reset to the start time.");
+    } catch (e) {
+      toast(errorText(e), "error");
+    }
   }
 
   async function saveTitle() {
@@ -197,12 +244,12 @@ export function MeetingsView({ refreshKey, selectId, onOpenLive, toast }: Props)
                 }`}
               >
                 <div className="flex items-center gap-2">
-                  <span className="truncate text-sm font-medium text-zinc-100">{m.title}</span>
+                  <span className="min-w-0 flex-1 truncate text-sm font-medium text-zinc-100">{m.title}</span>
                   {m.live && <Chip tone="ok">Live</Chip>}
+                  {!m.live && <DurationBadge seconds={m.duration_s} />}
                 </div>
                 <div className="mt-0.5 text-xs text-zinc-500">
-                  {formatDate(m.started_at)}
-                  {m.duration_s ? ` · ${formatDuration(m.duration_s)}` : ""}
+                  {formatDate(meetingTime(m))}
                   {m.line_count !== null ? ` · ${m.line_count} lines` : ""}
                   {m.has_notebook ? " · notes" : ""}
                 </div>
@@ -229,10 +276,13 @@ export function MeetingsView({ refreshKey, selectId, onOpenLive, toast }: Props)
                   onBlur={() => void saveTitle()}
                   onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
                 />
-                <div className="mt-0.5 text-xs text-zinc-500">
-                  {formatDate(detail.started_at)}
-                  {detail.duration_s ? ` · ${formatDuration(detail.duration_s)}` : ""} · {detail.transcript.length} lines
-                  {detail.legacy ? " · saved by an older version" : ""}
+                <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+                  <span>{formatDate(meetingTime(detail))}</span>
+                  {!live && <DurationBadge seconds={detail.duration_s} />}
+                  <span>
+                    {detail.transcript.length} lines
+                    {detail.legacy ? " · saved by an older version" : ""}
+                  </span>
                 </div>
               </div>
               {live ? (
@@ -311,6 +361,30 @@ export function MeetingsView({ refreshKey, selectId, onOpenLive, toast }: Props)
             )}
             {tab === "details" && (
               <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-zinc-400">Time</label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="datetime-local"
+                      className="rounded-md border border-line bg-panel-2 px-3 py-1.5 text-sm text-zinc-100 outline-none [color-scheme:dark] focus:border-accent"
+                      value={timeDraft}
+                      onChange={(e) => setTimeDraft(e.target.value)}
+                    />
+                    <Button
+                      disabled={!timeDraft || timeDraft === inputValue(meetingTime(detail))}
+                      onClick={() => void saveTime(timeDraft)}
+                    >
+                      Save time
+                    </Button>
+                    <Button
+                      disabled={!detail.meeting_time || inputValue(detail.meeting_time) === inputValue(detail.started_at)}
+                      onClick={() => void saveTime("")}
+                    >
+                      Use start time
+                    </Button>
+                  </div>
+                  <p className="mt-1 text-xs text-zinc-500">When the meeting took place. Defaults to when recording started.</p>
+                </div>
                 <div>
                   <label className="mb-1 block text-xs font-medium text-zinc-400">Context (agenda, participants, background)</label>
                   <textarea

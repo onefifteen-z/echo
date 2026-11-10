@@ -185,11 +185,11 @@ async function startFromPrompt(service: SidecarService, data: MeetingPromptData)
   const last = settings!.prefs().lastStart ?? DEFAULT_START;
   try {
     try {
-      await service.invoke("session.start", { ...last, title: data.title, context: "" });
+      await service.invoke("session.start", { ...last, title: data.title, context: "", meeting_time: data.detectedAt });
     } catch (err) {
       if (!last.vault) throw err;
       logLine(`meeting prompt: start with vault ${last.vault} failed (${String(err)}); retrying without a vault`);
-      await service.invoke("session.start", { ...last, vault: null, title: data.title, context: "" });
+      await service.invoke("session.start", { ...last, vault: null, title: data.title, context: "", meeting_time: data.detectedAt });
     }
     logLine(`meeting prompt: started transcription for ${data.appName}`);
     showWindow({ inactive: true });
@@ -197,7 +197,7 @@ async function startFromPrompt(service: SidecarService, data: MeetingPromptData)
   } catch (err) {
     logLine(`meeting prompt: start failed: ${String(err)}`);
     showWindow();
-    sendToWindow({ kind: "new", title: data.title });
+    sendToWindow({ kind: "new", title: data.title, meeting_time: data.detectedAt });
     void dialog.showMessageBox(mainWindow!, {
       type: "error",
       message: "Echo could not start transcribing",
@@ -223,7 +223,7 @@ function setupMeetingDetection(service: SidecarService): void {
     start: (data) => void startFromPrompt(service, data),
     setup: (data) => {
       showWindow();
-      sendToWindow({ kind: "new", title: data.title });
+      sendToWindow({ kind: "new", title: data.title, meeting_time: data.detectedAt });
     },
     mute: (data) => {
       const prefs = settings!.prefs();

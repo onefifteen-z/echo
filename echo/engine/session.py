@@ -53,6 +53,8 @@ from echo.engine.text import (
     _normalize_spaces,
     _render_asr_load_source_label,
     _short_asr_label,
+    meeting_time_label,
+    normalize_meeting_time,
     patch_meeting_json,
     summary_preview,
     _should_trigger_insight_live,
@@ -114,6 +116,7 @@ class EchoSession:
         language: str | None = None,
         vault: str | None = None,
         wiki: LuminaWiki | None = None,
+        meeting_time: str | None = None,
     ) -> None:
         self.replay_path = replay_path
         self.replay_lines = list(replay_lines)
@@ -164,6 +167,7 @@ class EchoSession:
         self.live_asr_language = env_lang if env_lang in self.live_asr_languages else "japanese"
         self._llm_offline = llm_offline
         self._wiki = wiki
+        self._meeting_time: str | None = normalize_meeting_time(meeting_time) if meeting_time else None
         self.vault: str | None = (vault or "").strip() or None
         self._vault_titles: dict[str, list[str]] = {}
         self._vault_warm_task: asyncio.Task[None] | None = None
@@ -410,6 +414,15 @@ class EchoSession:
 
     def set_notebook(self, text: str) -> None:
         self.notebook_md = text or ""
+
+    @property
+    def meeting_time(self) -> str:
+        """When the meeting took place (minute precision); defaults to when it was started."""
+        return self._meeting_time or normalize_meeting_time(self.started_at)
+
+    def set_meeting_time(self, value: str | None) -> None:
+        """Set the meeting time (ISO string); ``None`` / empty restores the default. Raises ``ValueError``."""
+        self._meeting_time = normalize_meeting_time(value) if value else None
 
     def set_meeting_metadata(self, title: str, context: str) -> None:
         self.meeting_title = (title or "").strip() or _UNTITLED_MEETING
@@ -665,6 +678,7 @@ class EchoSession:
                 insight_passes=insight_passes,
                 meeting_title=self.meeting_title,
                 meeting_context=self.meeting_context,
+                meeting_time=meeting_time_label(self.meeting_time),
                 dictionary_terms=self._dictionary_terms(),
                 notebook=self.notebook_md,
                 assets_dir=self.output_dir / "notes-assets",
@@ -690,6 +704,7 @@ class EchoSession:
             "id": self.output_dir.name,
             "title": self.meeting_title,
             "context": self.meeting_context,
+            "meeting_time": self.meeting_time,
             "started_at": self.started_at.isoformat(timespec="seconds"),
             "ended_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "duration_s": int(time.monotonic() - self._t0),

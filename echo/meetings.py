@@ -20,7 +20,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from echo.engine.text import _UNTITLED_MEETING, patch_meeting_json, summary_preview
+from echo.engine.text import (
+    _UNTITLED_MEETING,
+    meeting_time_label,
+    normalize_meeting_time,
+    patch_meeting_json,
+    summary_preview,
+)
 
 _MEETING_FILES = ("notes.txt", "summary.md", "insights.md", "meeting_context.md")
 SUMMARY_PLACEHOLDER = "_Generating meeting summary…_\n"
@@ -109,6 +115,11 @@ class MeetingStore:
         meta["legacy"] = legacy
         meta.setdefault("title", path.name)
         meta.setdefault("context", "")
+        if not meta.get("meeting_time"):
+            try:
+                meta["meeting_time"] = normalize_meeting_time(str(meta.get("started_at") or ""))
+            except ValueError:
+                meta["meeting_time"] = meta.get("started_at") or ""
         if "line_count" not in meta:
             notes = _read_local(path / "notes.txt") if local_only else _read(path / "notes.txt")
             meta["line_count"] = None if notes is None else sum(1 for ln in notes.splitlines() if ln.strip())
@@ -132,7 +143,7 @@ class MeetingStore:
                 meta["has_notebook"] = bool((_read_local(child / "notebook.md") or "").strip())
             meta.pop("version", None)
             items.append(meta)
-        items.sort(key=lambda m: str(m.get("started_at") or ""), reverse=True)
+        items.sort(key=lambda m: _sort_key(m), reverse=True)
         return items
 
     def get(self, meeting_id: str) -> dict[str, Any]:
@@ -161,14 +172,19 @@ class MeetingStore:
         title: str | None = None,
         context: str | None = None,
         notebook: str | None = None,
+        meeting_time: str | None = None,
     ) -> dict[str, Any]:
+        """Edit metadata / notebook. ``meeting_time`` is ISO; an empty string restores the default (start time)."""
         path = self._resolve(meeting_id)
         meta = self._meta(path)
         if title is not None:
             meta["title"] = title.strip() or _UNTITLED_MEETING
         if context is not None:
             meta["context"] = context.strip()
-        if title is not None or context is not None or meta.pop("legacy", False):
+        if meeting_time is not None:
+            raw = meeting_time or str(meta.get("started_at") or "")
+            meta["meeting_time"] = normalize_meeting_time(raw) if raw else ""
+        if title is not None or context is not None or meeting_time is not None or meta.pop("legacy", False):
             stored = {k: v for k, v in meta.items() if k not in ("legacy",)}
             stored.setdefault("version", 1)
             _atomic_write(path / "meeting.json", json.dumps(stored, ensure_ascii=False, indent=1))
@@ -193,6 +209,7 @@ class MeetingStore:
             "insight_passes": passes,
             "meeting_title": meta["title"],
             "meeting_context": meta.get("context", ""),
+            "meeting_time": meeting_time_label(meta.get("meeting_time")),
             "notebook": _read(path / "notebook.md"),
             "assets_dir": path / "notes-assets",
         }
@@ -215,6 +232,15 @@ class MeetingStore:
         _atomic_write(summary_path, md)
         patch_meeting_json(summary_path.parent, summary_preview=summary_preview(md))
         return md
+
+
+def _sort_key(meta: dict[str, Any]) -> float:
+    for key in ("meeting_time", "started_at"):
+        try:
+            return datetime.fromisoformat(str(meta.get(key) or "")).timestamp()
+        except ValueError:
+            continue
+    return 0.0
 
 
 def _atomic_write(path: Path, text: str) -> None:

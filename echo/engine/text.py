@@ -114,6 +114,27 @@ def summary_preview(md: str, limit: int = 160) -> str:
     return ""
 
 
+def normalize_meeting_time(value: str | datetime) -> str:
+    """ISO meeting time floored to the minute, with a UTC offset (naive input is local time).
+
+    Raises ``ValueError`` for unparsable strings.
+    """
+    dt = datetime.fromisoformat(value.strip()) if isinstance(value, str) else value
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.replace(second=0, microsecond=0).isoformat(timespec="seconds")
+
+
+def meeting_time_label(value: str | None) -> str:
+    """``YYYY-MM-DD HH:MM`` for prompts; empty when unset or unparsable."""
+    if not value:
+        return ""
+    try:
+        return f"{datetime.fromisoformat(value):%Y-%m-%d %H:%M}"
+    except ValueError:
+        return ""
+
+
 def patch_meeting_json(folder: Path, **fields: object) -> None:
     """Merge ``fields`` into ``folder/meeting.json`` (no-op when the folder has none)."""
     path = folder / "meeting.json"

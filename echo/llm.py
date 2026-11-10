@@ -440,6 +440,7 @@ Use the meeting title / background, the participant's own notebook, the (possibl
 
 Meeting (provided by user):
 - Title: <<<MEETING_TITLE>>>
+- Time: <<<MEETING_TIME>>>
 - Background/context:
 <<<
 <<<MEETING_CONTEXT>>>
@@ -1057,6 +1058,7 @@ async def llm_meeting_summary(
     dictionary_terms: "object" = (),
     notebook: str = "",
     assets_dir: Path | None = None,
+    meeting_time: str = "",
 ) -> str:
     """Produce a post-meeting markdown summary with **Key takeaways** and **Next actions**.
 
@@ -1110,6 +1112,7 @@ async def llm_meeting_summary(
         )
         return (
             MEETING_SUMMARY_TEMPLATE.replace("<<<MEETING_TITLE>>>", _meeting_title_for_prompt(meeting_title))
+            .replace("<<<MEETING_TIME>>>", meeting_time.strip() or "(unknown)")
             .replace("<<<MEETING_CONTEXT>>>", ctx)
             .replace("<<<DICTIONARY>>>", _dictionary_block(dictionary_terms))
             .replace("<<<NOTEBOOK>>>", blob)

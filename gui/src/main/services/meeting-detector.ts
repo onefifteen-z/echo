@@ -1,5 +1,6 @@
 /** Turns MeetingWatch reports into "meeting started" prompts (pure; no Electron). */
 
+import { localIsoMinute } from "../../shared/time";
 import type { MeetingApp } from "../../shared/types";
 import type { WatchReport } from "./meeting-watch-service";
 
@@ -34,6 +35,8 @@ export interface PromptRequest {
   app: MeetingApp;
   appName: string;
   title: string;
+  /** When capture was first seen (ISO, local offset, minute precision); becomes the meeting time. */
+  detectedAt: string;
 }
 
 export interface DetectorOptions {
@@ -52,6 +55,7 @@ export interface DetectorContext {
 
 interface Episode {
   polls: number;
+  firstSeen: number;
   lastSeen: number;
   prompted: boolean;
 }
@@ -101,7 +105,7 @@ export class MeetingDetector {
     this.expire(capturing, now);
     const out: PromptRequest[] = [];
     for (const id of capturing) {
-      const ep = this.episodes.get(id) ?? { polls: 0, lastSeen: now, prompted: false };
+      const ep = this.episodes.get(id) ?? { polls: 0, firstSeen: now, lastSeen: now, prompted: false };
       ep.polls += 1;
       ep.lastSeen = now;
       this.episodes.set(id, ep);
@@ -112,7 +116,12 @@ export class MeetingDetector {
       }
       ep.prompted = true;
       const app = KNOWN_APPS.find((a) => a.id === id)!;
-      out.push({ app: id, appName: app.name, title: meetingTitle(app, report.windows, new Date(now)) });
+      out.push({
+        app: id,
+        appName: app.name,
+        title: meetingTitle(app, report.windows, new Date(now)),
+        detectedAt: localIsoMinute(new Date(ep.firstSeen)),
+      });
     }
     return out;
   }

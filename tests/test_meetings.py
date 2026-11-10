@@ -86,7 +86,7 @@ def test_regenerate_summary_passes_notebook_and_insights(tmp_path: Path, monkeyp
     seen: dict = {}
 
     async def fake_summary(
-        transcript_text, *, insight_passes=None, meeting_title="", meeting_context="", dictionary_terms=(), notebook="", assets_dir=None
+        transcript_text, *, insight_passes=None, meeting_title="", meeting_context="", dictionary_terms=(), notebook="", assets_dir=None, meeting_time=""
     ):
         seen.update(
             transcript=transcript_text,

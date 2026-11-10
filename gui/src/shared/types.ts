@@ -70,6 +70,8 @@ export interface SessionStartArgs {
   mic_device?: number | null;
   /** Lumina vault name; omitted or null for none. */
   vault?: string | null;
+  /** ISO meeting time; omitted means "when transcription starts". */
+  meeting_time?: string;
 }
 
 export interface WikiVault {
@@ -101,6 +103,8 @@ export interface MeetingSummary {
   id: string;
   title: string;
   context: string;
+  /** When the meeting took place (ISO, minute precision); defaults to `started_at`. */
+  meeting_time?: string;
   started_at: string;
   ended_at?: string;
   duration_s: number | null;
@@ -128,6 +132,8 @@ export interface MeetingUpdate {
   title?: string;
   context?: string;
   notebook?: string;
+  /** ISO meeting time; "" restores the default (start time). */
+  meeting_time?: string;
 }
 
 /** Capture settings reused by "Start transcribing" in the meeting prompt. */
@@ -246,12 +252,14 @@ export interface MeetingWatchStatus {
 }
 
 /** Sent to the main window by the menu bar item and the meeting prompt. */
-export type TrayCommand = { kind: "stop" } | { kind: "new"; title?: string };
+export type TrayCommand = { kind: "stop" } | { kind: "new"; title?: string; meeting_time?: string };
 
 export interface MeetingPromptData {
   app: MeetingApp;
   appName: string;
   title: string;
+  /** When the meeting was detected (ISO with local offset, minute precision). */
+  detectedAt: string;
 }
 
 export type MeetingPromptAction =
